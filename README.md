@@ -106,6 +106,14 @@ architecture rtl of axi4lite_to_emif_bridge is
   signal aw_latched : std_logic := '0';
   signal w_latched  : std_logic := '0';
 
+  -- Internal copies of the AXI *READY signals -- needed because VHDL
+  -- (pre-2008) does not permit reading a port of mode OUT inside a
+  -- process. Drive the actual output ports from these via a concurrent
+  -- assignment instead of reading the ports directly.
+  signal awready_int : std_logic;
+  signal wready_int  : std_logic;
+  signal arready_int : std_logic;
+
   signal drive_data_out : std_logic := '0';
 
   function wait_active(w : std_logic_vector; pol : std_logic) return boolean is
@@ -124,10 +132,16 @@ begin
 
   EMIF_DATA_IO <= wdata_reg(EMIF_DATA_SIZE-1 downto 0) when drive_data_out = '1' else (others => 'Z');
 
-  -- AXI channel acceptance: only ready to accept a new AW/W/AR while IDLE
-  S_AXI_AWREADY <= '1' when (state = IDLE and aw_latched = '0') else '0';
-  S_AXI_WREADY  <= '1' when (state = IDLE and w_latched  = '0') else '0';
-  S_AXI_ARREADY <= '1' when (state = IDLE) else '0';
+  -- AXI channel acceptance: only ready to accept a new AW/W/AR while IDLE.
+  -- Computed into internal signals, then the output ports are driven from
+  -- these -- avoids reading a mode-OUT port inside the process below.
+  awready_int <= '1' when (state = IDLE and aw_latched = '0') else '0';
+  wready_int  <= '1' when (state = IDLE and w_latched  = '0') else '0';
+  arready_int <= '1' when (state = IDLE) else '0';
+
+  S_AXI_AWREADY <= awready_int;
+  S_AXI_WREADY  <= wready_int;
+  S_AXI_ARREADY <= arready_int;
 
   S_AXI_BRESP <= "00";  -- OKAY
   S_AXI_RRESP <= "00";  -- OKAY
@@ -149,12 +163,15 @@ begin
       else
 
         -- latch AW/W independently as they arrive, since AXI4 permits
-        -- them in either order or the same cycle
-        if S_AXI_AWVALID = '1' and S_AXI_AWREADY = '1' then
+        -- them in either order or the same cycle. Uses the internal
+        -- *_int copies of the ready signals (see declarations above) --
+        -- reading the S_AXI_*READY output ports directly here is not
+        -- legal in VHDL-93/2002, which is why this was rewritten.
+        if S_AXI_AWVALID = '1' and awready_int = '1' then
           awaddr_reg <= S_AXI_AWADDR;
           aw_latched <= '1';
         end if;
-        if S_AXI_WVALID = '1' and S_AXI_WREADY = '1' then
+        if S_AXI_WVALID = '1' and wready_int = '1' then
           wdata_reg <= S_AXI_WDATA;
           w_latched <= '1';
         end if;
