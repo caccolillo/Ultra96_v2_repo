@@ -276,8 +276,6 @@ begin
 end architecture rtl;
 
 
-
-
 `timescale 1ns/1ps
 //------------------------------------------------------------------------------
 // tb_axi4lite_to_emif_bridge.sv
@@ -384,14 +382,16 @@ module tb_axi4lite_to_emif_bridge;
   assign emif_data = emif_data_drive_en ? emif_data_drive : {EMIF_DATA_SIZE{1'bz}};
   assign emif_wait = '0;  // zero wait -- always ready
 
-  always_ff @(posedge emif_clk) begin
+  always_ff @(posedge aclk) begin
     emif_data_drive_en <= 1'b0;
     if (!emif_cs_n) begin
       if (!emif_we_n) begin
         mem[emif_addr] <= emif_data;
+        $display("[%0t] MODEL: WRITE captured -- addr=0x%04h data=0x%04h", $time, emif_addr, emif_data);
       end else if (!emif_oe_n) begin
         emif_data_drive    <= mem[emif_addr];
         emif_data_drive_en <= 1'b1;
+        $display("[%0t] MODEL: READ drive scheduled -- addr=0x%04h data=0x%04h", $time, emif_addr, mem[emif_addr]);
       end
     end
   end
@@ -491,5 +491,3 @@ module tb_axi4lite_to_emif_bridge;
   end
 
 endmodule
-
-
