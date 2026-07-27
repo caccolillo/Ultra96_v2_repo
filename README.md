@@ -45,7 +45,11 @@ entity axi4lite_to_emif_bridge is
     EMIF_ADDR_SIZE      : positive := 16;
     EMIF_DATA_SIZE      : positive := 16;
     EMIF_WAIT_SIZE       : positive := 2;
-    EMIF_WAIT_POLARITY   : std_logic := '1';
+    EMIF_WAIT_POLARITY   : natural range 0 to 1 := 1;  -- 1 = active-high wait
+                                                          -- (changed from std_logic:
+                                                          --  natural generics pass more
+                                                          --  reliably across VHDL/SV
+                                                          --  mixed-language sim boundaries)
     BA1_TIE              : std_logic := '0'
   );
   port (
@@ -116,9 +120,9 @@ architecture rtl of axi4lite_to_emif_bridge is
 
   signal drive_data_out : std_logic := '0';
 
-  function wait_active(w : std_logic_vector; pol : std_logic) return boolean is
+  function wait_active(w : std_logic_vector; pol : natural) return boolean is
   begin
-    if pol = '1' then
+    if pol = 1 then
       return unsigned(w) /= 0;
     else
       return unsigned(w) = 0;
@@ -272,6 +276,8 @@ begin
 end architecture rtl;
 
 
+
+
 `timescale 1ns/1ps
 //------------------------------------------------------------------------------
 // tb_axi4lite_to_emif_bridge.sv
@@ -332,7 +338,7 @@ module tb_axi4lite_to_emif_bridge;
     .EMIF_ADDR_SIZE     (EMIF_ADDR_SIZE),
     .EMIF_DATA_SIZE     (EMIF_DATA_SIZE),
     .EMIF_WAIT_SIZE     (EMIF_WAIT_SIZE),
-    .EMIF_WAIT_POLARITY (1'b1),
+    .EMIF_WAIT_POLARITY (1),
     .BA1_TIE            (1'b0)
   ) dut (
     .S_AXI_ACLK    (aclk),
@@ -395,27 +401,32 @@ module tb_axi4lite_to_emif_bridge;
   //----------------------------------------------------------------------------
   task automatic axi_write(input logic [C_S_AXI_ADDR_WIDTH-1:0] addr,
                             input logic [C_S_AXI_DATA_WIDTH-1:0] data);
+    logic aw_done, w_done;
+    aw_done = 1'b0;
+    w_done  = 1'b0;
+
     @(posedge aclk);
     awaddr  <= addr;  awvalid <= 1'b1;
     wdata   <= data;  wstrb   <= '1;  wvalid <= 1'b1;
     bready  <= 1'b1;
 
-    // AWREADY and WREADY may assert on different cycles -- handle
-    // independently rather than assuming simultaneous acceptance
-    fork
-      begin
-        wait (awready);
-        @(posedge aclk);
+    // Sample AWREADY/WREADY only at clock edges -- never in between.
+    // The previous fork/join + wait(signal) version could race, since
+    // wait() re-evaluates continuously rather than sampling synchronously,
+    // and can miss a ready pulse that's only valid for exactly one cycle.
+    while (!aw_done || !w_done) begin
+      @(posedge aclk);
+      if (!aw_done && awready) begin
         awvalid <= 1'b0;
+        aw_done = 1'b1;
       end
-      begin
-        wait (wready);
-        @(posedge aclk);
+      if (!w_done && wready) begin
         wvalid <= 1'b0;
+        w_done = 1'b1;
       end
-    join
+    end
 
-    wait (bvalid);
+    while (!bvalid) @(posedge aclk);
     if (bresp !== 2'b00)
       $error("WRITE to 0x%08h: non-OKAY BRESP = %0d", addr, bresp);
     @(posedge aclk);
@@ -431,11 +442,11 @@ module tb_axi4lite_to_emif_bridge;
     araddr <= addr; arvalid <= 1'b1;
     rready <= 1'b1;
 
-    wait (arready);
+    while (!arready) @(posedge aclk);
     @(posedge aclk);
     arvalid <= 1'b0;
 
-    wait (rvalid);
+    while (!rvalid) @(posedge aclk);
     data = rdata;
     if (rresp !== 2'b00)
       $error("READ from 0x%08h: non-OKAY RRESP = %0d", addr, rresp);
@@ -480,3 +491,5 @@ module tb_axi4lite_to_emif_bridge;
   end
 
 endmodule
+
+
