@@ -1,60 +1,49 @@
 --------------------------------------------------------------------------------
--- axi4lite_to_emif_bridge.vhd
+-- axi4lite_to_wishbone_bridge.vhd
 --
--- Connects DIRECTLY to xdma_0's M_AXI_LITE master port -- REPLACES
--- axi_bram_ctrl_0 entirely. No BRAM, no fixed-latency padding, no mailbox
--- protocol. This is a real AXI4-Lite slave: it uses genuine READY/VALID
--- backpressure, so it can stall for however many cycles the underlying
--- EMIF transaction (including a variable-length EMIF_WAIT_I) actually
--- takes -- no overrun risk, unlike the native-BRAM-port approach, because
--- AXI4-Lite is DESIGNED to support arbitrary-length stalls on both the
--- write-response (BVALID) and read-data (RVALID) channels.
+-- Direct AXI4-Lite -> Wishbone bridge. Replaces the EMIF-emulation approach
+-- entirely -- no synthesized EMIF bus cycles, no legacy emif_wishbone_if
+-- dependency. This talks Wishbone natively, on its own clock, matching the
+-- WB_* port/generic naming convention already used by emif_wishbone_if.vhd
+-- for consistency across the codebase.
 --
--- Every PC-side AXI-Lite write/read directly triggers one synthesized
--- EMIF transaction into your existing, UNTOUCHED emif_wishbone_if
--- converter. The AXI transaction simply doesn't complete until the real
--- EMIF cycle does -- which is exactly the correctness property the
--- native-BRAM-port version couldn't give you.
+-- CLOCK DOMAIN CROSSING: the AXI-Lite side (S_AXI_ACLK, 100 MHz from
+-- xdma_0) and the Wishbone side (CLK_I, 80 MHz -- matching the rest of
+-- your signal-processing logic) are genuinely unrelated clocks. This
+-- bridge uses TWO xpm_cdc_handshake macros (Xilinx's built-in, formally
+-- verified CDC library primitives -- no IP catalog customization needed,
+-- just instantiate directly from the xpm library) to safely cross the
+-- request (address+data+r/w) one way and the response (read data) back.
+-- Each xpm_cdc_handshake provides a full request/acknowledge handshake
+-- with proper double-flop synchronization on the control signals AND
+-- guarantees the multi-bit data bus is stable and consistent when sampled
+-- on the destination side -- the thing naive per-bit synchronizers can't
+-- guarantee for a bus.
 --
--- ============================== ASSUMPTIONS (verify before use) =============
--- 1. EMIF_ADDR_SIZE=16, EMIF_DATA_SIZE=16, EMIF_WAIT_SIZE=2,
---    EMIF_WAIT_POLARITY='1' -- matching your emif_wishbone_if.vhd generics.
--- 2. AXI address maps directly to EMIF address (lower bits); adjust the
---    slice in the EMIF_ADDR_O assignment if your address needs shifting
---    (e.g. if AXI addresses are byte-addressed and EMIF is word-addressed).
--- 3. Full 32-bit AXI data width, truncated to 16-bit EMIF data on write
---    (upper 16 bits ignored) and zero-extended on read (upper 16 bits
---    returned as 0). Adjust if you want different packing behaviour.
--- 4. BA1 (byte-lane select) tied to a fixed value -- full-word EMIF
---    transactions only through this path, matching the same simplification
---    used in the earlier bridge attempts.
--- 5. This assumes AWVALID and WVALID can arrive independently (not
---    necessarily the same cycle) -- handled via separate latch flags
---    below, which is the more general/robust case per the AXI4 spec
---    rather than assuming a simplified simultaneous-arrival master.
+-- Single-outstanding by construction: the AXI-side FSM will not start a
+-- new transaction until the previous one's response has come back through
+-- the second handshake -- matches your actual traffic (register pokes,
+-- occasional FFT snapshot reads), and avoids needing any outstanding-
+-- transaction tracking.
 --------------------------------------------------------------------------------
 
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
+library xpm;
+use xpm.vcomponents.all;
 
-entity axi4lite_to_emif_bridge is
+entity axi4lite_to_wishbone_bridge is
   generic (
     C_S_AXI_ADDR_WIDTH : integer := 32;
     C_S_AXI_DATA_WIDTH : integer := 32;
-    EMIF_ADDR_SIZE      : positive := 16;
-    EMIF_DATA_SIZE      : positive := 16;
-    EMIF_WAIT_SIZE       : positive := 2;
-    EMIF_WAIT_POLARITY   : natural range 0 to 1 := 1;  -- 1 = active-high wait
-                                                          -- (changed from std_logic:
-                                                          --  natural generics pass more
-                                                          --  reliably across VHDL/SV
-                                                          --  mixed-language sim boundaries)
-    BA1_TIE              : std_logic := '0'
+    WB_ADR_SIZE         : positive := 16;
+    WB_DAT_SIZE         : positive := 16;
+    INVERT_RESET        : std_logic := '0'  -- matches emif_wishbone_if's convention
   );
   port (
     -- ============ AXI4-Lite slave -- connects directly to xdma_0's =========
-    -- ============ M_AXI_LITE master port ====================================
+    -- ============ M_AXI_LITE master port, 100 MHz domain ====================
     S_AXI_ACLK    : in  std_logic;
     S_AXI_ARESETN : in  std_logic;
 
@@ -80,97 +69,106 @@ entity axi4lite_to_emif_bridge is
     S_AXI_RVALID  : out std_logic;
     S_AXI_RREADY  : in  std_logic;
 
-    -- ============ Drives directly into the existing emif_wishbone_if ======
-    EMIF_CLK_O   : out std_logic;   -- == S_AXI_ACLK, same clock throughout
-    EMIF_ADDR_O  : out std_logic_vector(EMIF_ADDR_SIZE-1 downto 0);
-    EMIF_DATA_IO : inout std_logic_vector(EMIF_DATA_SIZE-1 downto 0);
-    EMIF_WAIT_I  : in  std_logic_vector(EMIF_WAIT_SIZE-1 downto 0);
-    EMIF_CS_N_O  : out std_logic;
-    EMIF_WE_N_O  : out std_logic;
-    EMIF_OE_N_O  : out std_logic;
-    EMIF_BA1_O   : out std_logic
+    -- ============ Wishbone master -- same naming convention as ============
+    -- ============ emif_wishbone_if.vhd, 80 MHz domain ========================
+    CLK_I       : in  std_logic;   -- Wishbone-side clock, 80 MHz
+    RST_I       : in  std_logic;
+
+    WB_ADR_O    : out std_logic_vector(WB_ADR_SIZE-1 downto 0);
+    WB_RD_DAT_I : in  std_logic_vector(WB_DAT_SIZE-1 downto 0);
+    WB_WR_DAT_O : out std_logic_vector(WB_DAT_SIZE-1 downto 0);
+    WB_STB_O    : out std_logic;
+    WB_WR_O     : out std_logic;
+    WB_ACK_I    : in  std_logic;
+    WB_CYC_O    : out std_logic
   );
-end entity axi4lite_to_emif_bridge;
+end entity axi4lite_to_wishbone_bridge;
 
-architecture rtl of axi4lite_to_emif_bridge is
+architecture rtl of axi4lite_to_wishbone_bridge is
 
-  type state_t is (
-    IDLE,
-    WRITE_DRIVE, WRITE_WAIT,               -- write-side EMIF cycle
-    READ_DRIVE,  READ_WAIT, READ_CAPTURE,  -- read-side EMIF cycle
-    RESP_WRITE, RESP_READ                  -- present AXI response, wait for *READY
-  );
-  signal state : state_t := IDLE;
+  -- Request bundle crossing AXI (100MHz) -> WB (80MHz):
+  -- [ RNW(1) | ADDR(WB_ADR_SIZE) | WDATA(WB_DAT_SIZE) ]
+  constant REQ_WIDTH : integer := 1 + WB_ADR_SIZE + WB_DAT_SIZE;
 
-  signal awaddr_reg : std_logic_vector(C_S_AXI_ADDR_WIDTH-1 downto 0);
-  signal wdata_reg  : std_logic_vector(C_S_AXI_DATA_WIDTH-1 downto 0);
-  signal araddr_reg : std_logic_vector(C_S_AXI_ADDR_WIDTH-1 downto 0);
-  signal rdata_reg  : std_logic_vector(C_S_AXI_DATA_WIDTH-1 downto 0);
+  -- Response bundle crossing WB (80MHz) -> AXI (100MHz): just the read data
+  -- (unused/don't-care for writes, but always sent to keep one uniform
+  -- completion handshake for both read and write)
+  constant RESP_WIDTH : integer := WB_DAT_SIZE;
 
-  signal aw_latched : std_logic := '0';
-  signal w_latched  : std_logic := '0';
+  signal req_bundle   : std_logic_vector(REQ_WIDTH-1 downto 0);
+  signal req_send     : std_logic := '0';
+  signal req_rcv      : std_logic;
+  signal req_dest_out : std_logic_vector(REQ_WIDTH-1 downto 0);
+  signal req_dest_req : std_logic;
+  signal req_dest_ack : std_logic := '0';
 
-  -- Internal copies of the AXI *READY signals -- needed because VHDL
-  -- (pre-2008) does not permit reading a port of mode OUT inside a
-  -- process. Drive the actual output ports from these via a concurrent
-  -- assignment instead of reading the ports directly.
-  signal awready_int : std_logic;
-  signal wready_int  : std_logic;
-  signal arready_int : std_logic;
+  signal resp_bundle   : std_logic_vector(RESP_WIDTH-1 downto 0);
+  signal resp_send     : std_logic := '0';
+  signal resp_rcv      : std_logic;
+  signal resp_dest_out : std_logic_vector(RESP_WIDTH-1 downto 0);
+  signal resp_dest_req : std_logic;
+  signal resp_dest_ack : std_logic := '0';
 
-  signal drive_data_out : std_logic := '0';
+  ------------------------------------------------------------------------
+  -- AXI-side FSM (S_AXI_ACLK domain)
+  ------------------------------------------------------------------------
+  type axi_state_t is (AXI_IDLE, AXI_SEND_REQ, AXI_WAIT_RESP, AXI_RESP_WRITE, AXI_RESP_READ);
+  signal axi_state : axi_state_t := AXI_IDLE;
 
-  function wait_active(w : std_logic_vector; pol : natural) return boolean is
-  begin
-    if pol = 1 then
-      return unsigned(w) /= 0;
-    else
-      return unsigned(w) = 0;
-    end if;
-  end function;
+  signal awaddr_reg, araddr_reg : std_logic_vector(C_S_AXI_ADDR_WIDTH-1 downto 0);
+  signal wdata_reg               : std_logic_vector(C_S_AXI_DATA_WIDTH-1 downto 0);
+  signal rdata_reg               : std_logic_vector(C_S_AXI_DATA_WIDTH-1 downto 0);
+  signal aw_latched, w_latched   : std_logic := '0';
+  signal is_read_reg             : std_logic;
+
+  signal awready_int, wready_int, arready_int : std_logic;
+
+  ------------------------------------------------------------------------
+  -- WB-side FSM (CLK_I domain)
+  ------------------------------------------------------------------------
+  type wb_state_t is (WB_IDLE, WB_DRIVE, WB_WAIT_ACK, WB_CAPTURE, WB_SEND_RESP, WB_WAIT_RCV);
+  signal wb_state : wb_state_t := WB_IDLE;
+
+  signal wb_rnw     : std_logic;
+  signal wb_addr    : std_logic_vector(WB_ADR_SIZE-1 downto 0);
+  signal wb_wdata   : std_logic_vector(WB_DAT_SIZE-1 downto 0);
+  signal wb_rdata   : std_logic_vector(WB_DAT_SIZE-1 downto 0);
 
 begin
 
-  EMIF_CLK_O <= S_AXI_ACLK;
-  EMIF_BA1_O <= BA1_TIE;
-
-  EMIF_DATA_IO <= wdata_reg(EMIF_DATA_SIZE-1 downto 0) when drive_data_out = '1' else (others => 'Z');
-
-  -- AXI channel acceptance: only ready to accept a new AW/W/AR while IDLE.
-  -- Computed into internal signals, then the output ports are driven from
-  -- these -- avoids reading a mode-OUT port inside the process below.
-  awready_int <= '1' when (state = IDLE and aw_latched = '0') else '0';
-  wready_int  <= '1' when (state = IDLE and w_latched  = '0') else '0';
-  arready_int <= '1' when (state = IDLE) else '0';
+  ----------------------------------------------------------------------------
+  -- AXI-side ready signals (concurrent, internal signals per the earlier
+  -- fix -- avoids reading OUT-mode ports inside a process)
+  ----------------------------------------------------------------------------
+  awready_int <= '1' when (axi_state = AXI_IDLE and aw_latched = '0') else '0';
+  wready_int  <= '1' when (axi_state = AXI_IDLE and w_latched  = '0') else '0';
+  arready_int <= '1' when (axi_state = AXI_IDLE) else '0';
 
   S_AXI_AWREADY <= awready_int;
   S_AXI_WREADY  <= wready_int;
   S_AXI_ARREADY <= arready_int;
 
-  S_AXI_BRESP <= "00";  -- OKAY
-  S_AXI_RRESP <= "00";  -- OKAY
+  S_AXI_BRESP <= "00";
+  S_AXI_RRESP <= "00";
   S_AXI_RDATA <= rdata_reg;
 
+  ------------------------------------------------------------------------
+  -- AXI-side FSM
+  ------------------------------------------------------------------------
   process(S_AXI_ACLK)
   begin
     if rising_edge(S_AXI_ACLK) then
       if S_AXI_ARESETN = '0' then
-        state          <= IDLE;
-        aw_latched     <= '0';
-        w_latched      <= '0';
-        drive_data_out <= '0';
-        EMIF_CS_N_O    <= '1';
-        EMIF_WE_N_O    <= '1';
-        EMIF_OE_N_O    <= '1';
-        S_AXI_BVALID   <= '0';
-        S_AXI_RVALID   <= '0';
+        axi_state    <= AXI_IDLE;
+        aw_latched   <= '0';
+        w_latched    <= '0';
+        req_send     <= '0';
+        resp_dest_ack <= '0';
+        S_AXI_BVALID <= '0';
+        S_AXI_RVALID <= '0';
       else
+        resp_dest_ack <= '0';  -- default: single-cycle pulse (ack, not send -- fine as pulse)
 
-        -- latch AW/W independently as they arrive, since AXI4 permits
-        -- them in either order or the same cycle. Uses the internal
-        -- *_int copies of the ready signals (see declarations above) --
-        -- reading the S_AXI_*READY output ports directly here is not
-        -- legal in VHDL-93/2002, which is why this was rewritten.
         if S_AXI_AWVALID = '1' and awready_int = '1' then
           awaddr_reg <= S_AXI_AWADDR;
           aw_latched <= '1';
@@ -180,93 +178,191 @@ begin
           w_latched <= '1';
         end if;
 
-        case state is
+        case axi_state is
 
-          ------------------------------------------------------------------
-          when IDLE =>
+          when AXI_IDLE =>
             if aw_latched = '1' and w_latched = '1' then
-              -- write transaction ready to execute
-              EMIF_ADDR_O    <= awaddr_reg(EMIF_ADDR_SIZE-1 downto 0);
-              EMIF_CS_N_O    <= '0';
-              EMIF_WE_N_O    <= '0';
-              drive_data_out <= '1';
-              state          <= WRITE_DRIVE;
+              is_read_reg <= '0';
+              req_bundle  <= '0' & awaddr_reg(WB_ADR_SIZE-1 downto 0) & wdata_reg(WB_DAT_SIZE-1 downto 0);
+              req_send    <= '1';   -- held high, per xpm_cdc_handshake protocol,
+                                     -- until req_rcv confirms (cleared in AXI_SEND_REQ below)
+              axi_state   <= AXI_SEND_REQ;
             elsif S_AXI_ARVALID = '1' then
               araddr_reg  <= S_AXI_ARADDR;
-              EMIF_ADDR_O <= S_AXI_ARADDR(EMIF_ADDR_SIZE-1 downto 0);
-              EMIF_CS_N_O <= '0';
-              EMIF_OE_N_O <= '0';
-              state       <= READ_DRIVE;
+              is_read_reg <= '1';
+              req_bundle  <= '1' & S_AXI_ARADDR(WB_ADR_SIZE-1 downto 0) & (WB_DAT_SIZE-1 downto 0 => '0');
+              req_send    <= '1';   -- held high until req_rcv confirms
+              axi_state   <= AXI_SEND_REQ;
             end if;
 
-          ------------------------------------------------------------------
-          -- WRITE side: genuine backpressure -- stays here as long as
-          -- EMIF_WAIT_I says so, however many cycles that takes
-          ------------------------------------------------------------------
-          when WRITE_DRIVE =>
-            if wait_active(EMIF_WAIT_I, EMIF_WAIT_POLARITY) then
-              state <= WRITE_WAIT;
-            else
-              EMIF_CS_N_O    <= '1';
-              EMIF_WE_N_O    <= '1';
-              drive_data_out <= '0';
-              aw_latched     <= '0';
-              w_latched      <= '0';
-              S_AXI_BVALID   <= '1';
-              state          <= RESP_WRITE;
+          when AXI_SEND_REQ =>
+            -- req_send stays asserted (not reset each cycle) until the
+            -- macro confirms receipt via req_rcv -- per xpm_cdc_handshake's
+            -- documented protocol: src_send must only deassert once
+            -- src_rcv is asserted, not before.
+            if req_rcv = '1' then
+              req_send  <= '0';
+              axi_state <= AXI_WAIT_RESP;
             end if;
 
-          when WRITE_WAIT =>
-            if not wait_active(EMIF_WAIT_I, EMIF_WAIT_POLARITY) then
-              EMIF_CS_N_O    <= '1';
-              EMIF_WE_N_O    <= '1';
-              drive_data_out <= '0';
-              aw_latched     <= '0';
-              w_latched      <= '0';
-              S_AXI_BVALID   <= '1';
-              state          <= RESP_WRITE;
+          when AXI_WAIT_RESP =>
+            -- genuine backpressure: waits however long the real Wishbone
+            -- cycle takes on the other side, no fixed budget
+            if resp_dest_req = '1' then
+              rdata_reg     <= (others => '0');
+              rdata_reg(WB_DAT_SIZE-1 downto 0) <= resp_dest_out;
+              resp_dest_ack <= '1';
+              aw_latched    <= '0';
+              w_latched     <= '0';
+              if is_read_reg = '1' then
+                axi_state <= AXI_RESP_READ;
+              else
+                axi_state <= AXI_RESP_WRITE;
+              end if;
             end if;
-            -- else: stay here -- no cycle limit, genuinely arbitrary length
 
-          when RESP_WRITE =>
-            if S_AXI_BREADY = '1' then
+          when AXI_RESP_WRITE =>
+            S_AXI_BVALID <= '1';
+            if S_AXI_BREADY = '1' and S_AXI_BVALID = '1' then
               S_AXI_BVALID <= '0';
-              state        <= IDLE;
+              axi_state    <= AXI_IDLE;
             end if;
 
-          ------------------------------------------------------------------
-          -- READ side: same genuine backpressure property
-          ------------------------------------------------------------------
-          when READ_DRIVE =>
-            if wait_active(EMIF_WAIT_I, EMIF_WAIT_POLARITY) then
-              state <= READ_WAIT;
-            else
-              state <= READ_CAPTURE;
-            end if;
-
-          when READ_WAIT =>
-            if not wait_active(EMIF_WAIT_I, EMIF_WAIT_POLARITY) then
-              state <= READ_CAPTURE;
-            end if;
-            -- else: stay here -- no cycle limit, genuinely arbitrary length
-
-          when READ_CAPTURE =>
-            rdata_reg    <= (others => '0');
-            rdata_reg(EMIF_DATA_SIZE-1 downto 0) <= EMIF_DATA_IO;
-            EMIF_CS_N_O  <= '1';
-            EMIF_OE_N_O  <= '1';
+          when AXI_RESP_READ =>
             S_AXI_RVALID <= '1';
-            state        <= RESP_READ;
-
-          when RESP_READ =>
-            if S_AXI_RREADY = '1' then
+            if S_AXI_RREADY = '1' and S_AXI_RVALID = '1' then
               S_AXI_RVALID <= '0';
-              state        <= IDLE;
+              axi_state    <= AXI_IDLE;
             end if;
 
-          ------------------------------------------------------------------
           when others =>
-            state <= IDLE;
+            axi_state <= AXI_IDLE;
+
+        end case;
+      end if;
+    end if;
+  end process;
+
+  ------------------------------------------------------------------------
+  -- Request handshake: AXI (100MHz) -> WB (80MHz)
+  ------------------------------------------------------------------------
+  xpm_cdc_handshake_req : xpm_cdc_handshake
+    generic map (
+      DEST_EXT_HSK   => 1,   -- WB-side FSM controls exactly when to ack
+      DEST_SYNC_FF   => 4,
+      INIT_SYNC_FF   => 0,
+      SIM_ASSERT_CHK => 0,
+      SRC_SYNC_FF    => 4,
+      WIDTH          => REQ_WIDTH
+    )
+    port map (
+      src_clk  => S_AXI_ACLK,
+      src_in   => req_bundle,
+      src_send => req_send,
+      src_rcv  => req_rcv,
+      dest_clk => CLK_I,
+      dest_out => req_dest_out,
+      dest_req => req_dest_req,
+      dest_ack => req_dest_ack
+    );
+
+  ------------------------------------------------------------------------
+  -- Response handshake: WB (80MHz) -> AXI (100MHz)
+  ------------------------------------------------------------------------
+  xpm_cdc_handshake_resp : xpm_cdc_handshake
+    generic map (
+      DEST_EXT_HSK   => 1,   -- AXI-side FSM controls exactly when to ack
+      DEST_SYNC_FF   => 4,
+      INIT_SYNC_FF   => 0,
+      SIM_ASSERT_CHK => 0,
+      SRC_SYNC_FF    => 4,
+      WIDTH          => RESP_WIDTH
+    )
+    port map (
+      src_clk  => CLK_I,
+      src_in   => resp_bundle,
+      src_send => resp_send,
+      src_rcv  => resp_rcv,
+      dest_clk => S_AXI_ACLK,
+      dest_out => resp_dest_out,
+      dest_req => resp_dest_req,
+      dest_ack => resp_dest_ack
+    );
+
+  ------------------------------------------------------------------------
+  -- WB-side FSM (CLK_I, 80 MHz domain) -- a real Wishbone master
+  ------------------------------------------------------------------------
+  process(CLK_I)
+  begin
+    if rising_edge(CLK_I) then
+      if RST_I = INVERT_RESET then
+        wb_state     <= WB_IDLE;
+        req_dest_ack <= '0';
+        resp_send    <= '0';
+        WB_CYC_O     <= '0';
+        WB_STB_O     <= '0';
+        WB_WR_O      <= '0';
+      else
+        req_dest_ack <= '0';  -- default: single-cycle pulse (ack, fine as pulse)
+
+        case wb_state is
+
+          when WB_IDLE =>
+            if req_dest_req = '1' then
+              wb_rnw       <= req_dest_out(REQ_WIDTH-1);
+              wb_addr      <= req_dest_out(WB_ADR_SIZE+WB_DAT_SIZE-1 downto WB_DAT_SIZE);
+              wb_wdata     <= req_dest_out(WB_DAT_SIZE-1 downto 0);
+              req_dest_ack <= '1';   -- confirm receipt, frees AXI side's req handshake
+              wb_state     <= WB_DRIVE;
+            end if;
+
+          when WB_DRIVE =>
+            WB_ADR_O    <= wb_addr;
+            WB_CYC_O    <= '1';
+            WB_STB_O    <= '1';
+            WB_WR_O     <= not wb_rnw;
+            if wb_rnw = '0' then
+              WB_WR_DAT_O <= wb_wdata;
+            end if;
+            wb_state <= WB_WAIT_ACK;
+
+          when WB_WAIT_ACK =>
+            -- genuine Wishbone backpressure -- arbitrary length wait,
+            -- exactly matching classic Wishbone semantics, no fixed
+            -- cycle budget of any kind
+            if WB_ACK_I = '1' then
+              WB_CYC_O <= '0';
+              WB_STB_O <= '0';
+              WB_WR_O  <= '0';
+              if wb_rnw = '1' then
+                wb_state <= WB_CAPTURE;
+              else
+                resp_bundle <= (others => '0');
+                resp_send   <= '1';   -- held high, per xpm_cdc_handshake
+                                        -- protocol, until resp_rcv confirms
+                wb_state    <= WB_SEND_RESP;
+              end if;
+            end if;
+
+          when WB_CAPTURE =>
+            wb_rdata    <= WB_RD_DAT_I;
+            resp_bundle <= WB_RD_DAT_I;
+            resp_send   <= '1';   -- held high until resp_rcv confirms
+            wb_state    <= WB_SEND_RESP;
+
+          when WB_SEND_RESP =>
+            -- resp_send remains asserted (set above, not reset here) while
+            -- we wait in this and the next state for the macro to confirm
+            wb_state <= WB_WAIT_RCV;
+
+          when WB_WAIT_RCV =>
+            if resp_rcv = '1' then
+              resp_send <= '0';
+              wb_state  <= WB_IDLE;
+            end if;
+
+          when others =>
+            wb_state <= WB_IDLE;
 
         end case;
       end if;
@@ -274,220 +370,3 @@ begin
   end process;
 
 end architecture rtl;
-
-
-`timescale 1ns/1ps
-//------------------------------------------------------------------------------
-// tb_axi4lite_to_emif_bridge.sv
-//
-// Instantiates the VHDL axi4lite_to_emif_bridge directly (mixed-language
-// simulation -- Vivado XSim handles this fine as long as both files are
-// added to the same simulation set).
-//
-// The EMIF side is NOT your real emif_wishbone_if here -- it's a simple
-// zero-wait behavioural memory model standing in for it, just enough to
-// validate that a write through the bridge lands at the right address and
-// a read gets the right data back. Swap in your real emif_wishbone_if (or
-// a Wishbone-side memory behind it) once you want a more faithful test --
-// at that point also consider forcing the model to assert a few wait
-// cycles deliberately, to prove the bridge's backpressure genuinely holds
-// BVALID/RVALID off rather than just working by coincidence at zero wait.
-//------------------------------------------------------------------------------
-
-module tb_axi4lite_to_emif_bridge;
-
-  localparam C_S_AXI_ADDR_WIDTH = 32;
-  localparam C_S_AXI_DATA_WIDTH = 32;
-  localparam EMIF_ADDR_SIZE     = 16;
-  localparam EMIF_DATA_SIZE     = 16;
-  localparam EMIF_WAIT_SIZE     = 2;
-
-  logic aclk = 0;
-  logic aresetn = 0;
-  always #5 aclk = ~aclk;  // 100 MHz
-
-  // AXI4-Lite signals
-  logic [C_S_AXI_ADDR_WIDTH-1:0]     awaddr;
-  logic                              awvalid, awready;
-  logic [C_S_AXI_DATA_WIDTH-1:0]     wdata;
-  logic [(C_S_AXI_DATA_WIDTH/8)-1:0] wstrb;
-  logic                              wvalid, wready;
-  logic [1:0]                        bresp;
-  logic                              bvalid, bready;
-  logic [C_S_AXI_ADDR_WIDTH-1:0]     araddr;
-  logic                              arvalid, arready;
-  logic [C_S_AXI_DATA_WIDTH-1:0]     rdata;
-  logic [1:0]                        rresp;
-  logic                              rvalid, rready;
-
-  // EMIF-facing signals between DUT and the simple target model
-  logic                      emif_clk;
-  logic [EMIF_ADDR_SIZE-1:0] emif_addr;
-  wire  [EMIF_DATA_SIZE-1:0] emif_data;   // inout, driven by DUT (write) or model (read)
-  logic [EMIF_WAIT_SIZE-1:0] emif_wait;
-  logic                      emif_cs_n, emif_we_n, emif_oe_n, emif_ba1;
-
-  //----------------------------------------------------------------------------
-  // DUT -- VHDL entity instantiated directly from this SV testbench
-  //----------------------------------------------------------------------------
-  axi4lite_to_emif_bridge #(
-    .C_S_AXI_ADDR_WIDTH (C_S_AXI_ADDR_WIDTH),
-    .C_S_AXI_DATA_WIDTH (C_S_AXI_DATA_WIDTH),
-    .EMIF_ADDR_SIZE     (EMIF_ADDR_SIZE),
-    .EMIF_DATA_SIZE     (EMIF_DATA_SIZE),
-    .EMIF_WAIT_SIZE     (EMIF_WAIT_SIZE),
-    .EMIF_WAIT_POLARITY (1),
-    .BA1_TIE            (1'b0)
-  ) dut (
-    .S_AXI_ACLK    (aclk),
-    .S_AXI_ARESETN (aresetn),
-    .S_AXI_AWADDR  (awaddr),
-    .S_AXI_AWVALID (awvalid),
-    .S_AXI_AWREADY (awready),
-    .S_AXI_WDATA   (wdata),
-    .S_AXI_WSTRB   (wstrb),
-    .S_AXI_WVALID  (wvalid),
-    .S_AXI_WREADY  (wready),
-    .S_AXI_BRESP   (bresp),
-    .S_AXI_BVALID  (bvalid),
-    .S_AXI_BREADY  (bready),
-    .S_AXI_ARADDR  (araddr),
-    .S_AXI_ARVALID (arvalid),
-    .S_AXI_ARREADY (arready),
-    .S_AXI_RDATA   (rdata),
-    .S_AXI_RRESP   (rresp),
-    .S_AXI_RVALID  (rvalid),
-    .S_AXI_RREADY  (rready),
-    .EMIF_CLK_O    (emif_clk),
-    .EMIF_ADDR_O   (emif_addr),
-    .EMIF_DATA_IO  (emif_data),
-    .EMIF_WAIT_I   (emif_wait),
-    .EMIF_CS_N_O   (emif_cs_n),
-    .EMIF_WE_N_O   (emif_we_n),
-    .EMIF_OE_N_O   (emif_oe_n),
-    .EMIF_BA1_O    (emif_ba1)
-  );
-
-  //----------------------------------------------------------------------------
-  // Simple EMIF target model -- stand-in for emif_wishbone_if.
-  // Zero-wait: always completes in the cycle it's presented. Good enough
-  // to validate address decode and data correctness through the bridge.
-  //----------------------------------------------------------------------------
-  localparam MEM_DEPTH = 1 << EMIF_ADDR_SIZE;
-  logic [EMIF_DATA_SIZE-1:0] mem [0:MEM_DEPTH-1];
-
-  logic [EMIF_DATA_SIZE-1:0] emif_data_drive;
-  logic                      emif_data_drive_en;
-
-  assign emif_data = emif_data_drive_en ? emif_data_drive : {EMIF_DATA_SIZE{1'bz}};
-  assign emif_wait = '0;  // zero wait -- always ready
-
-  always_ff @(posedge aclk) begin
-    emif_data_drive_en <= 1'b0;
-    if (!emif_cs_n) begin
-      if (!emif_we_n) begin
-        mem[emif_addr] <= emif_data;
-        $display("[%0t] MODEL: WRITE captured -- addr=0x%04h data=0x%04h", $time, emif_addr, emif_data);
-      end else if (!emif_oe_n) begin
-        emif_data_drive    <= mem[emif_addr];
-        emif_data_drive_en <= 1'b1;
-        $display("[%0t] MODEL: READ drive scheduled -- addr=0x%04h data=0x%04h", $time, emif_addr, mem[emif_addr]);
-      end
-    end
-  end
-
-  //----------------------------------------------------------------------------
-  // Task 1: AXI4-Lite write
-  //----------------------------------------------------------------------------
-  task automatic axi_write(input logic [C_S_AXI_ADDR_WIDTH-1:0] addr,
-                            input logic [C_S_AXI_DATA_WIDTH-1:0] data);
-    logic aw_done, w_done;
-    aw_done = 1'b0;
-    w_done  = 1'b0;
-
-    @(posedge aclk);
-    awaddr  <= addr;  awvalid <= 1'b1;
-    wdata   <= data;  wstrb   <= '1;  wvalid <= 1'b1;
-    bready  <= 1'b1;
-
-    // Sample AWREADY/WREADY only at clock edges -- never in between.
-    // The previous fork/join + wait(signal) version could race, since
-    // wait() re-evaluates continuously rather than sampling synchronously,
-    // and can miss a ready pulse that's only valid for exactly one cycle.
-    while (!aw_done || !w_done) begin
-      @(posedge aclk);
-      if (!aw_done && awready) begin
-        awvalid <= 1'b0;
-        aw_done = 1'b1;
-      end
-      if (!w_done && wready) begin
-        wvalid <= 1'b0;
-        w_done = 1'b1;
-      end
-    end
-
-    while (!bvalid) @(posedge aclk);
-    if (bresp !== 2'b00)
-      $error("WRITE to 0x%08h: non-OKAY BRESP = %0d", addr, bresp);
-    @(posedge aclk);
-    bready <= 1'b0;
-  endtask
-
-  //----------------------------------------------------------------------------
-  // Task 2: AXI4-Lite read
-  //----------------------------------------------------------------------------
-  task automatic axi_read(input  logic [C_S_AXI_ADDR_WIDTH-1:0] addr,
-                           output logic [C_S_AXI_DATA_WIDTH-1:0] data);
-    @(posedge aclk);
-    araddr <= addr; arvalid <= 1'b1;
-    rready <= 1'b1;
-
-    while (!arready) @(posedge aclk);
-    @(posedge aclk);
-    arvalid <= 1'b0;
-
-    while (!rvalid) @(posedge aclk);
-    data = rdata;
-    if (rresp !== 2'b00)
-      $error("READ from 0x%08h: non-OKAY RRESP = %0d", addr, rresp);
-    @(posedge aclk);
-    rready <= 1'b0;
-  endtask
-
-  //----------------------------------------------------------------------------
-  // Simple test: random address, random data, write then read back, check
-  //----------------------------------------------------------------------------
-  logic [C_S_AXI_ADDR_WIDTH-1:0] test_addr;
-  logic [C_S_AXI_DATA_WIDTH-1:0] test_wdata;
-  logic [C_S_AXI_DATA_WIDTH-1:0] test_rdata;
-
-  initial begin
-    awvalid = 0; wvalid = 0; bready = 0; arvalid = 0; rready = 0;
-    awaddr  = '0; wdata = '0; wstrb = '0; araddr = '0;
-
-    repeat (5) @(posedge aclk);
-    aresetn <= 1'b1;
-    repeat (5) @(posedge aclk);
-
-    // random address within the EMIF address space; random 16-bit data
-    // (upper 16 bits of the 32-bit AXI word read back as 0, per the DUT's
-    // zero-extend-on-read behaviour)
-    test_addr  = $urandom_range(0, MEM_DEPTH-1);
-    test_wdata = {16'h0000, $urandom_range(0, 32'hFFFF)};
-
-    $display("[%0t] Writing 0x%08h to address 0x%08h", $time, test_wdata, test_addr);
-    axi_write(test_addr, test_wdata);
-
-    axi_read(test_addr, test_rdata);
-    $display("[%0t] Read back 0x%08h from address 0x%08h", $time, test_rdata, test_addr);
-
-    if (test_rdata === test_wdata)
-      $display("PASS: read-back matches write");
-    else
-      $error("FAIL: wrote 0x%08h, read 0x%08h", test_wdata, test_rdata);
-
-    $display("TEST COMPLETE");
-    $finish;
-  end
-
-endmodule
