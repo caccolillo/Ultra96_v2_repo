@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 poll_reg.py -- repeatedly read a single 32-bit register through a PCIe
@@ -39,6 +38,28 @@ def sigbus_handler(signum, frame):
     os._exit(1)  # os._exit, not sys.exit -- avoids running cleanup that
                  # could itself touch the now-suspect mapping
 
+def enable_device(resource_path):
+    """
+    Writes '1' to the device's sysfs 'enable' attribute (Memory Space
+    Enable in the PCI Command register) before touching the BAR. This is
+    normally done automatically by a bound kernel driver's probe()
+    function -- since we're accessing the device raw via sysfs with no
+    driver bound, nothing does this for us, and it resets to whatever the
+    firmware leaves it as on every fresh enumeration (reboot, rescan,
+    board power cycle).
+    """
+    device_dir = os.path.dirname(resource_path)
+    enable_path = os.path.join(device_dir, "enable")
+    try:
+        with open(enable_path, "w") as f:
+            f.write("1")
+        print(f"Enabled device via {enable_path}")
+    except OSError as e:
+        print(f"WARNING: could not write to {enable_path}: {e}")
+        print("Continuing anyway -- if the device was already enabled this is harmless;")
+        print("if not, the mmap/read below will likely fail.")
+
+
 def main():
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <resource_path> <offset_hex> [interval_seconds]")
@@ -50,6 +71,8 @@ def main():
     interval = float(sys.argv[3]) if len(sys.argv) > 3 else 0.5
 
     signal.signal(signal.SIGBUS, sigbus_handler)
+
+    enable_device(resource_path)
 
     fd = os.open(resource_path, os.O_RDWR | os.O_SYNC)
     mm = mmap.mmap(fd, 4096)
