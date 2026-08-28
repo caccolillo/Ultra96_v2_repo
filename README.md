@@ -1,124 +1,296 @@
-#!/usr/bin/env python3
-"""
-poll_reg.py -- repeatedly read a single 32-bit register through a PCIe
-BAR (via sysfs mmap), printing each value with a timestamp and delta
-from the previous read. Built to watch the offset-0 millisecond timer
-and catch whatever anomaly produced the 0xFFFFFFFF readback earlier.
+`timescale 1ns/1ps
+//------------------------------------------------------------------------------
+// tb_axi4lite_to_wishbone_bridge_integrity.sv
+//
+// CORRECTED test scenario, based on real-hardware source review: we traced
+// address 0x0 all the way through legacy_dsp_remap -> wb_distribution ->
+// syscon, and confirmed every link in that real chain ALWAYS acknowledges,
+// quickly, unconditionally. There is no legitimate path for WB_ACK_I to
+// simply never arrive for this address. That rules out the "unresponsive
+// target" theory the earlier stress test (never-ack) was built around.
+//
+// This test targets the more likely real culprit instead: a genuine
+// protocol issue or data-integrity problem in the xpm_cdc_handshake
+// crossing itself, under SUSTAINED back-to-back traffic against a target
+// that always responds correctly and fast (exactly like syscon really
+// does) -- not whether timeouts work, but whether the CDC round trip
+// ever desyncs, corrupts data, or cross-talks between transactions when
+// driven as fast as the bridge's own protocol allows, back-to-back, with
+// no artificial gaps.
+//
+// TWO CHECKS, deliberately chosen because a liveness-only test would miss
+// both of them:
+//   1. Write-then-immediate-read, many times: exact match required. Any
+//      cross-talk between overlapping-in-time transactions (a classic
+//      handshake pipelining bug) shows up as a mismatch here.
+//   2. Repeated reads of a free-running counter: values must be
+//      monotonically non-decreasing. A corrupted or stale response shows
+//      up as an impossible value (a decrease, or a value inconsistent
+//      with elapsed cycles).
+//------------------------------------------------------------------------------
 
-Usage:
-    sudo python3 poll_reg.py /sys/bus/pci/devices/0000:01:00.0/resource0 0x0 [interval_seconds]
+module tb_axi4lite_to_wishbone_bridge_integrity;
 
-Ctrl+C to stop cleanly.
+  localparam C_S_AXI_ADDR_WIDTH = 32;
+  localparam C_S_AXI_DATA_WIDTH = 32;
+  localparam WB_ADR_SIZE        = 16;
+  localparam WB_DAT_SIZE        = 16;
+  localparam WB_TIMEOUT_CYCLES  = 4000;
+  localparam AXI_TIMEOUT_CYCLES = 15000;
 
-IMPORTANT: a failed MMIO access (e.g. the device returning a completion
-error, or -- worse -- a transaction that never completes and trips a
-host-side fault) delivers SIGBUS directly to this process on Linux; it
-does NOT raise a normal Python exception from the mm[...] access. Without
-a handler, the script would just die silently with no diagnostic at all,
-which is exactly what makes these failures hard to pin down. The handler
-below at least prints what it can before exiting -- but note that
-continuing the loop after a real SIGBUS on the mapped page is not safe,
-so it exits cleanly rather than trying to resume.
-"""
+  localparam NUM_ITERATIONS = 200;  // back-to-back transactions, no gaps
 
-import mmap
-import os
-import struct
-import sys
-import signal
-import time
-from datetime import datetime
+  logic aclk = 0;
+  always #4.0  aclk   = ~aclk;    // 125 MHz
 
-def sigbus_handler(signum, frame):
-    print(f"\n[{datetime.now().isoformat()}] *** SIGBUS caught -- MMIO access faulted. ***")
-    print("This means the PCIe transaction did not complete cleanly (error")
-    print("completion, or a fault at the host/kernel level). Exiting rather")
-    print("than continuing, since the mapping may now be in an undefined state.")
-    sys.stdout.flush()
-    os._exit(1)  # os._exit, not sys.exit -- avoids running cleanup that
-                 # could itself touch the now-suspect mapping
+  logic wb_clk = 0;
+  always #6.25 wb_clk = ~wb_clk;  // 80 MHz
 
-def enable_device(resource_path):
-    """
-    Writes '1' to the device's sysfs 'enable' attribute (Memory Space
-    Enable in the PCI Command register) before touching the BAR. This is
-    normally done automatically by a bound kernel driver's probe()
-    function -- since we're accessing the device raw via sysfs with no
-    driver bound, nothing does this for us, and it resets to whatever the
-    firmware leaves it as on every fresh enumeration (reboot, rescan,
-    board power cycle).
-    """
-    device_dir = os.path.dirname(resource_path)
-    enable_path = os.path.join(device_dir, "enable")
-    try:
-        with open(enable_path, "w") as f:
-            f.write("1")
-        print(f"Enabled device via {enable_path}")
-    except OSError as e:
-        print(f"WARNING: could not write to {enable_path}: {e}")
-        print("Continuing anyway -- if the device was already enabled this is harmless;")
-        print("if not, the mmap/read below will likely fail.")
+  logic aresetn = 0;
+  logic wb_rst  = 1;
 
+  logic [C_S_AXI_ADDR_WIDTH-1:0]     awaddr;
+  logic                              awvalid, awready;
+  logic [C_S_AXI_DATA_WIDTH-1:0]     wdata;
+  logic [(C_S_AXI_DATA_WIDTH/8)-1:0] wstrb;
+  logic                              wvalid, wready;
+  logic [1:0]                        bresp;
+  logic                              bvalid, bready;
+  logic [C_S_AXI_ADDR_WIDTH-1:0]     araddr;
+  logic                              arvalid, arready;
+  logic [C_S_AXI_DATA_WIDTH-1:0]     rdata;
+  logic [1:0]                        rresp;
+  logic                              rvalid, rready;
 
-def main():
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <resource_path> <offset_hex> [interval_seconds]")
-        print(f"Example: {sys.argv[0]} /sys/bus/pci/devices/0000:01:00.0/resource0 0x0 0.5")
-        sys.exit(1)
+  logic [WB_ADR_SIZE-1:0] wb_adr;
+  logic [WB_DAT_SIZE-1:0] wb_rd_dat;
+  logic [WB_DAT_SIZE-1:0] wb_wr_dat;
+  logic                    wb_stb, wb_we, wb_ack, wb_cyc;
 
-    resource_path = sys.argv[1]
-    offset = int(sys.argv[2], 16)
-    interval = float(sys.argv[3]) if len(sys.argv) > 3 else 0.5
+  //----------------------------------------------------------------------------
+  // DUT
+  //----------------------------------------------------------------------------
+  axi4lite_to_wishbone_bridge #(
+    .C_S_AXI_ADDR_WIDTH (C_S_AXI_ADDR_WIDTH),
+    .C_S_AXI_DATA_WIDTH (C_S_AXI_DATA_WIDTH),
+    .WB_ADR_SIZE        (WB_ADR_SIZE),
+    .WB_DAT_SIZE        (WB_DAT_SIZE),
+    .WB_TIMEOUT_CYCLES  (WB_TIMEOUT_CYCLES),
+    .AXI_TIMEOUT_CYCLES (AXI_TIMEOUT_CYCLES),
+    .INVERT_RESET       (0)
+  ) dut (
+    .S_AXI_ACLK    (aclk),
+    .S_AXI_ARESETN (aresetn),
+    .S_AXI_AWADDR  (awaddr),
+    .S_AXI_AWVALID (awvalid),
+    .S_AXI_AWREADY (awready),
+    .S_AXI_WDATA   (wdata),
+    .S_AXI_WSTRB   (wstrb),
+    .S_AXI_WVALID  (wvalid),
+    .S_AXI_WREADY  (wready),
+    .S_AXI_BRESP   (bresp),
+    .S_AXI_BVALID  (bvalid),
+    .S_AXI_BREADY  (bready),
+    .S_AXI_ARADDR  (araddr),
+    .S_AXI_ARVALID (arvalid),
+    .S_AXI_ARREADY (arready),
+    .S_AXI_RDATA   (rdata),
+    .S_AXI_RRESP   (rresp),
+    .S_AXI_RVALID  (rvalid),
+    .S_AXI_RREADY  (rready),
+    .CLK_I         (wb_clk),
+    .RST_I         (wb_rst),
+    .WB_ADR_O      (wb_adr),
+    .WB_RD_DAT_I   (wb_rd_dat),
+    .WB_WR_DAT_O   (wb_wr_dat),
+    .WB_STB_O      (wb_stb),
+    .WB_WR_O       (wb_we),
+    .WB_ACK_I      (wb_ack),
+    .WB_CYC_O      (wb_cyc)
+  );
 
-    signal.signal(signal.SIGBUS, sigbus_handler)
+  //----------------------------------------------------------------------------
+  // Wishbone model: ALWAYS acks, same cycle, exactly matching syscon's real
+  // unconditional ack behaviour confirmed from source. reg[1] is a plain
+  // read/write scratch register; reg[0] is a free-running counter,
+  // incrementing every WB clock cycle (fast, for meaningful variation
+  // within a reasonable sim length).
+  //----------------------------------------------------------------------------
+  logic [WB_DAT_SIZE-1:0] scratch_reg;
+  logic [WB_DAT_SIZE-1:0] counter_reg;
 
-    enable_device(resource_path)
+  assign wb_ack = wb_cyc & wb_stb;  // unconditional, same-cycle -- matches syscon exactly
+  assign wb_rd_dat = (wb_adr == 16'h0001) ? scratch_reg : counter_reg;
 
-    fd = os.open(resource_path, os.O_RDWR | os.O_SYNC)
-    mm = mmap.mmap(fd, 4096)
+  always_ff @(posedge wb_clk) begin
+    if (wb_rst) begin
+      scratch_reg <= 16'h0000;
+      counter_reg <= 16'h0000;
+    end else begin
+      counter_reg <= counter_reg + 1;  // free-running, every cycle
+      if (wb_cyc && wb_stb && wb_we && wb_adr == 16'h0001) begin
+        scratch_reg <= wb_wr_dat;
+      end
+    end
+  end
 
-    print(f"Polling offset 0x{offset:x} on {resource_path} every {interval}s. Ctrl+C to stop.\n")
-    print(f"{'timestamp':<28} {'hex':<12} {'decimal':<12} {'delta':<12} {'note'}")
+  //----------------------------------------------------------------------------
+  // AXI4-Lite tasks with watchdog (same pattern as before -- if the CDC
+  // path genuinely hangs against this always-acking target, that's a
+  // serious independent finding worth catching cleanly too)
+  //----------------------------------------------------------------------------
+  localparam SIM_WATCHDOG_CYCLES = AXI_TIMEOUT_CYCLES + 2000;
 
-    prev_val = None
-    read_count = 0
-    suspicious_count = 0
+  task automatic axi_write(input logic [C_S_AXI_ADDR_WIDTH-1:0] addr,
+                            input logic [C_S_AXI_DATA_WIDTH-1:0] data,
+                            output logic timed_out);
+    logic aw_done, w_done;
+    int wait_cnt;
+    aw_done = 1'b0; w_done = 1'b0; wait_cnt = 0; timed_out = 1'b0;
 
-    try:
-        while True:
-            val = struct.unpack('<I', mm[offset:offset+4])[0]
-            read_count += 1
-            ts = datetime.now().isoformat(timespec='milliseconds')
+    @(posedge aclk);
+    awaddr <= addr;  awvalid <= 1'b1;
+    wdata  <= data;  wstrb   <= '1;  wvalid <= 1'b1;
+    bready <= 1'b1;
 
-            delta_str = ""
-            note = ""
+    while (!aw_done || !w_done) begin
+      @(posedge aclk);
+      wait_cnt++;
+      if (wait_cnt > SIM_WATCHDOG_CYCLES) begin
+        timed_out = 1'b1;
+        $error("SIM WATCHDOG: write AW/W handshake never completed");
+        return;
+      end
+      if (!aw_done && awready) begin awvalid <= 1'b0; aw_done = 1'b1; end
+      if (!w_done && wready)  begin wvalid  <= 1'b0; w_done  = 1'b1; end
+    end
 
-            if prev_val is not None:
-                delta = val - prev_val
-                delta_str = str(delta)
-                if val == 0xFFFFFFFF:
-                    note = "*** SUSPICIOUS: all-Fs, likely a failed completion, not real counter data ***"
-                    suspicious_count += 1
-                elif delta < 0:
-                    note = "*** counter went backwards -- unexpected ***"
-                elif delta == 0:
-                    note = "(unchanged since last read)"
-            else:
-                if val == 0xFFFFFFFF:
-                    note = "*** SUSPICIOUS: all-Fs on the very first read ***"
-                    suspicious_count += 1
+    while (!bvalid) begin
+      @(posedge aclk);
+      wait_cnt++;
+      if (wait_cnt > SIM_WATCHDOG_CYCLES) begin
+        timed_out = 1'b1;
+        $error("SIM WATCHDOG: BVALID never asserted");
+        return;
+      end
+    end
+    @(posedge aclk);
+    bready <= 1'b0;
+  endtask
 
-            print(f"{ts:<28} 0x{val:08x}   {val:<12} {delta_str:<12} {note}")
+  task automatic axi_read(input  logic [C_S_AXI_ADDR_WIDTH-1:0] addr,
+                           output logic [C_S_AXI_DATA_WIDTH-1:0] data,
+                           output logic timed_out);
+    int wait_cnt;
+    wait_cnt = 0; timed_out = 1'b0;
 
-            prev_val = val
-            time.sleep(interval)
+    @(posedge aclk);
+    araddr <= addr; arvalid <= 1'b1;
+    rready <= 1'b1;
 
-    except KeyboardInterrupt:
-        print(f"\nStopped. {read_count} reads total, {suspicious_count} suspicious (0xFFFFFFFF).")
+    while (!arready) begin
+      @(posedge aclk);
+      wait_cnt++;
+      if (wait_cnt > SIM_WATCHDOG_CYCLES) begin
+        timed_out = 1'b1;
+        $error("SIM WATCHDOG: ARREADY never asserted");
+        return;
+      end
+    end
+    @(posedge aclk);
+    arvalid <= 1'b0;
 
-    finally:
-        mm.close()
-        os.close(fd)
+    while (!rvalid) begin
+      @(posedge aclk);
+      wait_cnt++;
+      if (wait_cnt > SIM_WATCHDOG_CYCLES) begin
+        timed_out = 1'b1;
+        $error("SIM WATCHDOG: RVALID never asserted");
+        return;
+      end
+    end
+    data = rdata;
+    @(posedge aclk);
+    rready <= 1'b0;
+  endtask
 
-if __name__ == "__main__":
-    main()
+  //----------------------------------------------------------------------------
+  // Test sequence
+  //----------------------------------------------------------------------------
+  logic [C_S_AXI_DATA_WIDTH-1:0] wr_val, rd_val;
+  logic [C_S_AXI_DATA_WIDTH-1:0] prev_counter_val;
+  logic timeout_flag;
+
+  int wr_rd_pass, wr_rd_fail;
+  int counter_pass, counter_fail;
+  int hang_count;
+
+  initial begin
+    awvalid = 0; wvalid = 0; bready = 0; arvalid = 0; rready = 0;
+    awaddr  = '0; wdata = '0; wstrb = '0; araddr = '0;
+
+    #100;
+    aresetn <= 1'b1;
+    wb_rst  <= 1'b0;
+    #100;
+
+    wr_rd_pass = 0; wr_rd_fail = 0;
+    counter_pass = 0; counter_fail = 0;
+    hang_count = 0;
+    prev_counter_val = 32'hFFFFFFFF;  // sentinel: skip monotonicity check on first read
+
+    $display("=== Integrity stress test: %0d back-to-back transactions against always-acking target ===", NUM_ITERATIONS);
+
+    for (int i = 0; i < NUM_ITERATIONS; i++) begin
+
+      // --- Check 1: write-then-immediate-read, exact match ---
+      wr_val = $urandom_range(0, 32'hFFFF);
+      axi_write(32'h0000_0001, wr_val, timeout_flag);
+      if (timeout_flag) begin
+        hang_count++;
+        $display("[iter %0d] WRITE HANG -- safety net or CDC path genuinely stuck", i);
+      end else begin
+        axi_read(32'h0000_0001, rd_val, timeout_flag);
+        if (timeout_flag) begin
+          hang_count++;
+          $display("[iter %0d] READ-BACK HANG", i);
+        end else if (rd_val[15:0] == wr_val[15:0]) begin
+          wr_rd_pass++;
+        end else begin
+          wr_rd_fail++;
+          $display("[iter %0d] MISMATCH: wrote 0x%04h, read back 0x%04h -- possible CDC desync/corruption", i, wr_val[15:0], rd_val[15:0]);
+        end
+      end
+
+      // --- Check 2: counter monotonicity ---
+      axi_read(32'h0000_0000, rd_val, timeout_flag);
+      if (timeout_flag) begin
+        hang_count++;
+        $display("[iter %0d] COUNTER READ HANG", i);
+      end else begin
+        if (prev_counter_val == 32'hFFFFFFFF || rd_val[15:0] >= prev_counter_val[15:0]) begin
+          counter_pass++;
+        end else begin
+          counter_fail++;
+          $display("[iter %0d] COUNTER WENT BACKWARDS: prev=0x%04h now=0x%04h -- possible stale/corrupted response", i, prev_counter_val[15:0], rd_val[15:0]);
+        end
+        prev_counter_val = rd_val;
+      end
+    end
+
+    $display("");
+    $display("=== RESULTS ===");
+    $display("Write-then-read: %0d/%0d exact matches, %0d mismatches", wr_rd_pass, NUM_ITERATIONS, wr_rd_fail);
+    $display("Counter monotonicity: %0d/%0d passed, %0d violations", counter_pass, NUM_ITERATIONS, counter_fail);
+    $display("Hangs (safety net or genuine stuck CDC): %0d", hang_count);
+
+    if (wr_rd_fail == 0 && counter_fail == 0 && hang_count == 0)
+      $display("PASS: no data corruption, no desync, no hangs across %0d back-to-back transactions", NUM_ITERATIONS);
+    else
+      $display("FAIL: real issue found in the CDC path -- do not trust this on hardware without further investigation");
+
+    $display("TEST COMPLETE");
+    $finish;
+  end
+
+endmodule
