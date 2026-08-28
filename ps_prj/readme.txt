@@ -1,4 +1,3 @@
-
 -- axi4lite_to_wishbone_bridge.vhd
 --
 -- Direct AXI4-Lite -> Wishbone bridge. This talks Wishbone natively, on its own
