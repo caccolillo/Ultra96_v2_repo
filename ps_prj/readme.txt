@@ -12,6 +12,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FLASH_PART="mt25ql128-spi-x1_x2_x4"
+TCL_GEN="$SCRIPT_DIR/gen_mcs.tcl"
+TCL_PROG="$SCRIPT_DIR/program_flash.tcl"
 
 # --- Find .bit file ---
 BIT_FILES=("$SCRIPT_DIR"/*.bit)
@@ -29,7 +31,6 @@ PRM_FILE="$SCRIPT_DIR/${BIT_NAME}.prm"
 
 echo "Bitstream : $BIT_FILE"
 echo "MCS       : $MCS_FILE"
-echo "Flash     : $FLASH_PART"
 echo ""
 
 # --- Check Vivado ---
@@ -37,30 +38,22 @@ if ! command -v vivado &>/dev/null; then
     echo "ERROR: vivado not found. Source settings64.sh first."; exit 1
 fi
 
-# --- Step 1: Generate MCS (separate Vivado batch call) ---
-echo "Generating MCS..."
-vivado -mode batch -nojournal -nolog -source /dev/stdin << TCLEOF
-write_cfgmem \
-    -format    mcs   \
-    -interface spix4 \
-    -size      16    \
-    -loadbit   "up 0x0 {$BIT_FILE}" \
-    -file      {$MCS_FILE} \
+# --- Write gen_mcs.tcl ---
+cat > "$TCL_GEN" << TCLEOF
+puts "Writing MCS from: $BIT_FILE"
+puts "Output: $MCS_FILE"
+write_cfgmem \\
+    -format    mcs   \\
+    -interface spix4 \\
+    -size      16    \\
+    -loadbit   "up 0x0 {$BIT_FILE}" \\
+    -file      {$MCS_FILE} \\
     -force
-puts "write_cfgmem done."
+puts "write_cfgmem completed."
 TCLEOF
 
-# Verify MCS was created
-if [[ ! -f "$MCS_FILE" ]]; then
-    echo "ERROR: MCS file was not generated: $MCS_FILE"; exit 1
-fi
-echo "MCS generated OK: $MCS_FILE"
-echo ""
-
-# --- Step 2: Program FPGA then flash (separate Vivado batch call) ---
-echo "Programming FPGA and flash..."
-vivado -mode batch -nojournal -nolog -source /dev/stdin << TCLEOF
-
+# --- Write program_flash.tcl ---
+cat > "$TCL_PROG" << TCLEOF
 open_hw_manager
 connect_hw_server -allow_non_jtag
 open_hw_target
@@ -69,19 +62,17 @@ set dev [lindex [get_hw_devices] 0]
 current_hw_device \$dev
 puts "Device: \$dev"
 
-# Program FPGA first so Vivado can use it as SPI bridge
 puts "Programming FPGA..."
 set_property PROGRAM.FILE {$BIT_FILE} \$dev
 program_hw_devices \$dev
 refresh_hw_device \$dev
 puts "FPGA programmed OK."
 
-# Use cfgmem auto-created by Vivado, or create one if needed
 set cfgmem [get_property PROGRAM.HW_CFGMEM \$dev]
 if {\$cfgmem eq ""} {
     puts "Creating cfgmem..."
-    create_hw_cfgmem \
-        -hw_device \$dev \
+    create_hw_cfgmem \\
+        -hw_device \$dev \\
         -mem_dev   [lindex [get_cfgmem_parts {$FLASH_PART}] 0]
     set cfgmem [get_property PROGRAM.HW_CFGMEM \$dev]
 } else {
@@ -103,6 +94,24 @@ close_hw_target
 disconnect_hw_server
 close_hw_manager
 TCLEOF
+
+# --- Step 1: Generate MCS ---
+echo "Step 1: Generating MCS..."
+vivado -mode batch -nojournal -nolog -source "$TCL_GEN"
+
+if [[ ! -f "$MCS_FILE" ]]; then
+    echo "ERROR: MCS not generated. Check Vivado output above."
+    exit 1
+fi
+echo "MCS OK: $MCS_FILE ($(du -h "$MCS_FILE" | cut -f1))"
+echo ""
+
+# --- Step 2: Program ---
+echo "Step 2: Programming FPGA and flash..."
+vivado -mode batch -nojournal -nolog -source "$TCL_PROG"
+
+# --- Cleanup temp Tcl files ---
+rm -f "$TCL_GEN" "$TCL_PROG"
 
 echo ""
 echo "Done -- power cycle the board to boot from flash."
