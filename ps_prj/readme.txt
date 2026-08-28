@@ -305,7 +305,11 @@ begin
 
   xpm_cdc_handshake_resp : xpm_cdc_handshake
     generic map (
-      DEST_EXT_HSK   => 1,
+      DEST_EXT_HSK   => 0,   -- auto-ack: dest_req self-clears after one cycle,
+                              -- resp_rcv arrives without needing resp_dest_ack.
+                              -- Required because the AXI FSM may return to IDLE
+                              -- (and stop driving resp_dest_ack) before the WB
+                              -- FSM's WB_WAIT_RCV sees resp_rcv.
       DEST_SYNC_FF   => 4,
       INIT_SYNC_FF   => 1,
       SIM_ASSERT_CHK => 0,
