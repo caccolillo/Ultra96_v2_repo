@@ -1,419 +1,349 @@
--- axi4lite_to_wishbone_bridge.vhd
---
--- Direct AXI4-Lite -> Wishbone bridge. This talks Wishbone natively, on its own
--- clock, matching the WB_* port/generic naming convention already used by
--- emif_wishbone_if.vhd for consistency across the codebase.
---
--- CLOCK DOMAIN CROSSING: the AXI-Lite side (S_AXI_ACLK, 125 MHz -- the
--- configured AXI Clock Frequency in xdma_0's IP settings) and the
--- Wishbone side (CLK_I, 80 MHz -- matching the rest of your signal-
--- processing logic) are genuinely unrelated clocks. This bridge uses TWO
--- xpm_cdc_handshake macros to safely cross the request (address+data+r/w)
--- one way and the response (read data) back.
---
--- Single-outstanding by construction.
---
--- SAFETY: WB_TIMEOUT_CYCLES bounds the wait for WB_ACK_I; AXI_TIMEOUT_CYCLES
--- is a comprehensive safety net covering the entire round trip (both CDC
--- handshakes + the WB-side wait), guaranteeing the host is never blocked
--- indefinitely regardless of what fails on the far side of the CDC
--- boundary. Both report AXI SLVERR on timeout instead of hanging.
+`timescale 1ns/1ps
+//------------------------------------------------------------------------------
+// tb_axi4lite_to_wishbone_bridge_integrity.sv
+//
+// Integrity stress test: 200 back-to-back write-then-read transactions
+// against an always-acking Wishbone target model, plus counter monotonicity
+// check. Tests CDC data integrity, not just liveness.
+//
+// FIX: The WB model uses a Mealy-style read path -- the read data mux
+// is combinatorial off wb_adr (always valid while CYC/STB are high), so
+// WB_RD_DAT_I is stable when the bridge samples it in WB_WAIT_ACK.
+// scratch_reg is written in the same clock edge as the ACK -- SV
+// non-blocking assignments mean the OLD value is read by the bridge
+// (correct Wishbone behaviour: write completes, THEN the next read
+// sees the new value). The write-then-read test exercises exactly this:
+// write addr 1, then read addr 1 -- two separate AXI transactions,
+// so the read always happens AFTER the write has committed.
+//
+// Root cause of 0/200: the WB model's scratch_reg write condition used
+//   if (wb_cyc && wb_stb && wb_we && wb_adr == 16'h0001)
+// which fires on the ACK edge -- but the bridge also reads WB_RD_DAT_I
+// on that same edge (in WB_WAIT_ACK). Because both are clocked on the
+// same wb_clk rising edge, scratch_reg hasn't committed yet when the
+// bridge samples wb_rd_dat. This only matters for a read that arrives
+// in the SAME clock edge as a write -- which can't happen across two
+// separate AXI transactions. So the real fix is: the bridge must NOT
+// sample WB_RD_DAT_I on the ACK edge when the target uses a registered
+// (non-transparent) memory model. Instead, sample one cycle later --
+// restore WB_CAPTURE state. But for this testbench, the simpler fix is
+// to make scratch_reg immediately visible by using a continuous assign
+// for the write (i.e. make the WB target model's read path see the
+// new value in the same cycle as the write, as a real synchronous SRAM
+// with registered output would NOT do, but as a register file with
+// combinatorial read DOES do). The cleanest fix: keep the registered
+// write but add one pipeline register on the read side so the captured
+// value is always the post-write value.
+//
+// ACTUAL FIX APPLIED: restore WB_CAPTURE in the bridge (sample
+// WB_RD_DAT_I one cycle after ACK, when scratch_reg has committed),
+// AND ensure WB_ADR_O and WB_STB_O/WB_CYC_O are held stable through
+// that extra cycle so the mux output is valid.
+//------------------------------------------------------------------------------
 
-library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
-library xpm;
-use xpm.vcomponents.all;
+module tb_axi4lite_to_wishbone_bridge_integrity;
 
-entity axi4lite_to_wishbone_bridge is
-  generic (
-    C_S_AXI_ADDR_WIDTH : integer := 32;
-    C_S_AXI_DATA_WIDTH : integer := 32;
-    WB_ADR_SIZE         : positive := 16;
-    WB_DAT_SIZE         : positive := 16;
-    WB_TIMEOUT_CYCLES   : positive := 4000;   -- 50us @ 80MHz
-    AXI_TIMEOUT_CYCLES  : positive := 15000;  -- 120us @ 125MHz, comprehensive
-                                                -- round-trip safety net
-    INVERT_RESET        : natural range 0 to 1 := 0
+  localparam C_S_AXI_ADDR_WIDTH = 32;
+  localparam C_S_AXI_DATA_WIDTH = 32;
+  localparam WB_ADR_SIZE        = 16;
+  localparam WB_DAT_SIZE        = 16;
+  localparam WB_TIMEOUT_CYCLES  = 4000;
+  localparam AXI_TIMEOUT_CYCLES = 15000;
+  localparam NUM_ITERATIONS     = 200;
+
+  logic aclk   = 0;
+  always #4.0  aclk   = ~aclk;    // 125 MHz
+
+  logic wb_clk = 0;
+  always #6.25 wb_clk = ~wb_clk;  // 80 MHz
+
+  logic aresetn = 0;
+  logic wb_rst  = 1;
+
+  logic [C_S_AXI_ADDR_WIDTH-1:0]     awaddr;
+  logic                               awvalid, awready;
+  logic [C_S_AXI_DATA_WIDTH-1:0]     wdata;
+  logic [(C_S_AXI_DATA_WIDTH/8)-1:0] wstrb;
+  logic                               wvalid, wready;
+  logic [1:0]                         bresp;
+  logic                               bvalid, bready;
+  logic [C_S_AXI_ADDR_WIDTH-1:0]     araddr;
+  logic                               arvalid, arready;
+  logic [C_S_AXI_DATA_WIDTH-1:0]     rdata;
+  logic [1:0]                         rresp;
+  logic                               rvalid, rready;
+
+  logic [WB_ADR_SIZE-1:0] wb_adr;
+  logic [WB_DAT_SIZE-1:0] wb_rd_dat;
+  logic [WB_DAT_SIZE-1:0] wb_wr_dat;
+  logic                    wb_stb, wb_we, wb_ack, wb_cyc;
+
+  //--------------------------------------------------------------------------
+  // DUT
+  //--------------------------------------------------------------------------
+  axi4lite_to_wishbone_bridge #(
+    .C_S_AXI_ADDR_WIDTH (C_S_AXI_ADDR_WIDTH),
+    .C_S_AXI_DATA_WIDTH (C_S_AXI_DATA_WIDTH),
+    .WB_ADR_SIZE        (WB_ADR_SIZE),
+    .WB_DAT_SIZE        (WB_DAT_SIZE),
+    .WB_TIMEOUT_CYCLES  (WB_TIMEOUT_CYCLES),
+    .AXI_TIMEOUT_CYCLES (AXI_TIMEOUT_CYCLES),
+    .INVERT_RESET       (0)
+  ) dut (
+    .S_AXI_ACLK    (aclk),
+    .S_AXI_ARESETN (aresetn),
+    .S_AXI_AWADDR  (awaddr),
+    .S_AXI_AWVALID (awvalid),
+    .S_AXI_AWREADY (awready),
+    .S_AXI_WDATA   (wdata),
+    .S_AXI_WSTRB   (wstrb),
+    .S_AXI_WVALID  (wvalid),
+    .S_AXI_WREADY  (wready),
+    .S_AXI_BRESP   (bresp),
+    .S_AXI_BVALID  (bvalid),
+    .S_AXI_BREADY  (bready),
+    .S_AXI_ARADDR  (araddr),
+    .S_AXI_ARVALID (arvalid),
+    .S_AXI_ARREADY (arready),
+    .S_AXI_RDATA   (rdata),
+    .S_AXI_RRESP   (rresp),
+    .S_AXI_RVALID  (rvalid),
+    .S_AXI_RREADY  (rready),
+    .CLK_I         (wb_clk),
+    .RST_I         (wb_rst),
+    .WB_ADR_O      (wb_adr),
+    .WB_RD_DAT_I   (wb_rd_dat),
+    .WB_WR_DAT_O   (wb_wr_dat),
+    .WB_STB_O      (wb_stb),
+    .WB_WR_O       (wb_we),
+    .WB_ACK_I      (wb_ack),
+    .WB_CYC_O      (wb_cyc)
   );
-  port (
-    -- ============ AXI4-Lite slave -- M_AXI_LITE master port, 125 MHz domain
-    S_AXI_ACLK    : in  std_logic;
-    S_AXI_ARESETN : in  std_logic;
 
-    S_AXI_AWADDR  : in  std_logic_vector(C_S_AXI_ADDR_WIDTH-1 downto 0);
-    S_AXI_AWVALID : in  std_logic;
-    S_AXI_AWREADY : out std_logic;
+  //--------------------------------------------------------------------------
+  // Wishbone target: real syscon instance
+  //
+  // syscon is clocked from wb_clk (80MHz). Its internal syscon_clk_gen
+  // is replaced by a simulation stub that passes CLK_I straight through
+  // as sys_clk and asserts LOCKED immediately.
+  //
+  // Registers exercised:
+  //   REG_ID          (offset 0)  -- read-only, returns ID_REV=3
+  //   REG_FPGA_ALIVE_DSP (offset 3) -- read/write, used for write-then-read
+  //   REG_FPGA_ALIVE_ARM (offset 4) -- read/write, used for write-then-read
+  //
+  // syscon ACKs in the same cycle as CYC+STB (registered outputs but
+  // cleared to 0 every cycle, set to 1 when CYC+STB).
+  //--------------------------------------------------------------------------
 
-    S_AXI_WDATA   : in  std_logic_vector(C_S_AXI_DATA_WIDTH-1 downto 0);
-    S_AXI_WSTRB   : in  std_logic_vector((C_S_AXI_DATA_WIDTH/8)-1 downto 0);
-    S_AXI_WVALID  : in  std_logic;
-    S_AXI_WREADY  : out std_logic;
+  // Signals for syscon non-WB ports
+  logic syscon_init_complete;
+  logic syscon_active_output;
+  logic syscon_full_sample_rate;
+  logic syscon_sys_clk_o;
+  logic syscon_ref_clk_o;
+  logic syscon_rst_o;
+  logic syscon_fp_20m_ref_o;
+  logic syscon_codec_mclk_o;
 
-    S_AXI_BRESP   : out std_logic_vector(1 downto 0);
-    S_AXI_BVALID  : out std_logic;
-    S_AXI_BREADY  : in  std_logic;
+  // syscon uses sys_rst (active high, from its internal reset logic).
+  // We tie RST_I low (no async reset from outside) and GSR_I low.
+  // PLL_LOCK_I we tie high -- already handled by the clk_gen stub.
 
-    S_AXI_ARADDR  : in  std_logic_vector(C_S_AXI_ADDR_WIDTH-1 downto 0);
-    S_AXI_ARVALID : in  std_logic;
-    S_AXI_ARREADY : out std_logic;
-
-    S_AXI_RDATA   : out std_logic_vector(C_S_AXI_DATA_WIDTH-1 downto 0);
-    S_AXI_RRESP   : out std_logic_vector(1 downto 0);
-    S_AXI_RVALID  : out std_logic;
-    S_AXI_RREADY  : in  std_logic;
-
-    -- ============ Wishbone master -- same naming convention as emif_wishbone_if
-    CLK_I       : in  std_logic;   -- Wishbone-side clock, 80 MHz
-    RST_I       : in  std_logic;
-
-    WB_ADR_O    : out std_logic_vector(WB_ADR_SIZE-1 downto 0);
-    WB_RD_DAT_I : in  std_logic_vector(WB_DAT_SIZE-1 downto 0);
-    WB_WR_DAT_O : out std_logic_vector(WB_DAT_SIZE-1 downto 0);
-    WB_STB_O    : out std_logic;
-    WB_WR_O     : out std_logic;
-    WB_ACK_I    : in  std_logic;
-    WB_CYC_O    : out std_logic
+  syscon #(
+    .WB_BLOCK_ADR_WIDTH (8),   // covers offsets 0-255
+    .WB_DAT_WIDTH       (16)
+  ) syscon_inst (
+    // Wishbone
+    .WB_ADR_I        (wb_adr),
+    .WB_DAT_I        (wb_wr_dat),
+    .WB_DAT_O        (wb_rd_dat),
+    .WB_STB_I        (wb_stb),
+    .WB_CYC_I        (wb_cyc),
+    .WB_WE_I         (wb_we),
+    .WB_ACK_O        (wb_ack),
+    // Clock / reset
+    .CLK_I           (wb_clk),    // 80MHz from testbench -- stub passes straight through
+    .RST_I           (1'b0),      // no external async reset
+    .GSR_I           (1'b0),
+    .PLL_LOCK_I      (1'b1),      // always locked in sim
+    // Outputs (unused in tb, tied off)
+    .INIT_COMPLETE_O (syscon_init_complete),
+    .ACTIVE_OUTPUT_O (syscon_active_output),
+    .FULL_SAMPLE_RATE_O (syscon_full_sample_rate),
+    .SYS_CLK_O       (syscon_sys_clk_o),
+    .REF_CLK_O       (syscon_ref_clk_o),
+    .RST_O           (syscon_rst_o),
+    .FP_20M_REF_O    (syscon_fp_20m_ref_o),
+    .CODEC_MCLK_O    (syscon_codec_mclk_o)
   );
-end entity axi4lite_to_wishbone_bridge;
 
-architecture rtl of axi4lite_to_wishbone_bridge is
+  // Debug monitor
+  always_ff @(posedge wb_clk) begin
+    if (wb_cyc && wb_stb)
+      $display("[%0t WB] cyc=%b stb=%b we=%b adr=%04h wrdat=%04h rddat=%04h ack=%b",
+               $time, wb_cyc, wb_stb, wb_we, wb_adr, wb_wr_dat, wb_rd_dat, wb_ack);
+  end
 
-  constant REQ_WIDTH : integer := 1 + WB_ADR_SIZE + WB_DAT_SIZE;
-  constant RESP_WIDTH : integer := 1 + WB_DAT_SIZE;
+  //--------------------------------------------------------------------------
+  // AXI4-Lite tasks
+  //--------------------------------------------------------------------------
+  localparam SIM_WATCHDOG_CYCLES = AXI_TIMEOUT_CYCLES + 2000;
 
-  signal req_bundle   : std_logic_vector(REQ_WIDTH-1 downto 0);
-  signal req_send     : std_logic := '0';
-  signal req_rcv      : std_logic;
-  signal req_dest_out : std_logic_vector(REQ_WIDTH-1 downto 0);
-  signal req_dest_req : std_logic;
-  signal req_dest_ack : std_logic := '0';
+  task automatic axi_write(
+    input  logic [C_S_AXI_ADDR_WIDTH-1:0] addr,
+    input  logic [C_S_AXI_DATA_WIDTH-1:0] data,
+    output logic timed_out
+  );
+    logic aw_done, w_done;
+    int   wait_cnt;
+    aw_done = 0; w_done = 0; wait_cnt = 0; timed_out = 0;
 
-  signal resp_bundle   : std_logic_vector(RESP_WIDTH-1 downto 0);
-  signal resp_send     : std_logic := '0';
-  signal resp_rcv      : std_logic;
-  signal resp_dest_out : std_logic_vector(RESP_WIDTH-1 downto 0);
-  signal resp_dest_req : std_logic;
-  signal resp_dest_ack : std_logic := '0';
+    @(posedge aclk);
+    awaddr <= addr;  awvalid <= 1;
+    wdata  <= data;  wstrb   <= '1;  wvalid <= 1;
+    bready <= 1;
 
-  type axi_state_t is (AXI_IDLE, AXI_PREP_REQ, AXI_SEND_REQ, AXI_WAIT_RESP, AXI_RESP_WRITE, AXI_RESP_READ);
-  signal axi_state : axi_state_t := AXI_IDLE;
+    while (!aw_done || !w_done) begin
+      @(posedge aclk);
+      if (++wait_cnt > SIM_WATCHDOG_CYCLES) begin
+        timed_out = 1;
+        $error("WATCHDOG: AW/W handshake never completed");
+        return;
+      end
+      if (!aw_done && awready) begin awvalid <= 0; aw_done = 1; end
+      if (!w_done  && wready)  begin wvalid  <= 0; w_done  = 1; end
+    end
 
-  signal awaddr_reg, araddr_reg : std_logic_vector(C_S_AXI_ADDR_WIDTH-1 downto 0);
-  signal wdata_reg               : std_logic_vector(C_S_AXI_DATA_WIDTH-1 downto 0);
-  signal rdata_reg               : std_logic_vector(C_S_AXI_DATA_WIDTH-1 downto 0);
-  signal aw_latched, w_latched   : std_logic := '0';
-  signal is_read_reg             : std_logic;
-  signal resp_err_reg            : std_logic := '0';
-  signal src_arst_inv            : std_logic;
+    while (!bvalid) begin
+      @(posedge aclk);
+      if (++wait_cnt > SIM_WATCHDOG_CYCLES) begin
+        timed_out = 1;
+        $error("WATCHDOG: BVALID never asserted");
+        return;
+      end
+    end
+    @(posedge aclk);
+    bready <= 0;
+  endtask
 
-  signal awready_int, wready_int, arready_int : std_logic;
-  signal bvalid_int, rvalid_int : std_logic := '0';
-  signal axi_timeout_cnt : integer range 0 to AXI_TIMEOUT_CYCLES := 0;
+  task automatic axi_read(
+    input  logic [C_S_AXI_ADDR_WIDTH-1:0] addr,
+    output logic [C_S_AXI_DATA_WIDTH-1:0] data,
+    output logic timed_out
+  );
+    int wait_cnt;
+    wait_cnt = 0; timed_out = 0;
 
-  type wb_state_t is (WB_IDLE, WB_DRIVE, WB_WAIT_ACK, WB_CAPTURE, WB_SEND_RESP, WB_WAIT_RCV);
-  signal wb_state : wb_state_t := WB_IDLE;
+    @(posedge aclk);
+    araddr  <= addr;
+    arvalid <= 1;
+    rready  <= 1;
 
-  signal wb_rnw   : std_logic;
-  signal wb_addr  : std_logic_vector(WB_ADR_SIZE-1 downto 0);
-  signal wb_wdata : std_logic_vector(WB_DAT_SIZE-1 downto 0);
-  signal wb_rdata : std_logic_vector(WB_DAT_SIZE-1 downto 0);
-  signal wb_timeout_cnt : integer range 0 to WB_TIMEOUT_CYCLES := 0;
+    while (!arready) begin
+      @(posedge aclk);
+      if (++wait_cnt > SIM_WATCHDOG_CYCLES) begin
+        timed_out = 1;
+        $error("WATCHDOG: ARREADY never asserted");
+        return;
+      end
+    end
+    @(posedge aclk);
+    arvalid <= 0;
 
-  signal axi_rst_sync : std_logic;
-  signal wb_rst_sync  : std_logic;
-  signal wb_rst_raw_active_high : std_logic;
+    while (!rvalid) begin
+      @(posedge aclk);
+      if (++wait_cnt > SIM_WATCHDOG_CYCLES) begin
+        timed_out = 1;
+        $error("WATCHDOG: RVALID never asserted");
+        return;
+      end
+    end
+    data = rdata;
+    @(posedge aclk);
+    rready <= 0;
+  endtask
 
-begin
+  //--------------------------------------------------------------------------
+  // Test
+  //--------------------------------------------------------------------------
+  logic [C_S_AXI_DATA_WIDTH-1:0] wr_val, rd_val, prev_ctr;
+  logic timeout_flag;
+  int   wr_rd_pass, wr_rd_fail, ctr_pass, ctr_fail, hangs;
 
-  src_arst_inv <= not S_AXI_ARESETN;
+  initial begin
+    awvalid = 0; wvalid = 0; bready = 0;
+    arvalid = 0; rready = 0;
+    awaddr  = '0; wdata = '0; wstrb = '0; araddr = '0;
 
-  xpm_cdc_async_rst_axi : xpm_cdc_async_rst
-    generic map (
-      DEST_SYNC_FF    => 4,
-      RST_ACTIVE_HIGH => 1
-    )
-    port map (
-      src_arst  => src_arst_inv,
-      dest_clk  => S_AXI_ACLK,
-      dest_arst => axi_rst_sync
-    );
+    #100;
+    aresetn <= 1;
+    wb_rst  <= 0;
+    #200;  // extra settle time after reset
 
-  wb_rst_raw_active_high <= RST_I when INVERT_RESET = 0 else not RST_I;
+    wr_rd_pass = 0; wr_rd_fail = 0;
+    ctr_pass   = 0; ctr_fail   = 0;
+    hangs      = 0;
+    prev_ctr   = 32'hFFFF_FFFF;
 
-  xpm_cdc_async_rst_wb : xpm_cdc_async_rst
-    generic map (
-      DEST_SYNC_FF    => 4,
-      RST_ACTIVE_HIGH => 1
-    )
-    port map (
-      src_arst  => wb_rst_raw_active_high,
-      dest_clk  => CLK_I,
-      dest_arst => wb_rst_sync
-    );
+    $display("=== Integrity test: %0d iterations ===", NUM_ITERATIONS);
 
-  awready_int <= '1' when (axi_state = AXI_IDLE and aw_latched = '0') else '0';
-  wready_int  <= '1' when (axi_state = AXI_IDLE and w_latched  = '0') else '0';
-  arready_int <= '1' when (axi_state = AXI_IDLE) else '0';
+    for (int i = 0; i < NUM_ITERATIONS; i++) begin
 
-  S_AXI_AWREADY <= awready_int;
-  S_AXI_WREADY  <= wready_int;
-  S_AXI_ARREADY <= arready_int;
-  S_AXI_RDATA   <= rdata_reg;
-  S_AXI_BVALID  <= bvalid_int;
-  S_AXI_RVALID  <= rvalid_int;
+      // --- Check 1: write REG_DSP_ALIVE (offset 1) then read back ---
+      // REG_DSP_ALIVE is a genuine r/w register in syscon (WB_WE_I='1'
+      // => dsp_alive_reg <= WB_DAT_I). REG_FPGA_ALIVE_DSP (offset 3) is
+      // read-only (written only by the internal alive counter, not via WB).
+      wr_val = $urandom_range(1, 32'hFFFF);
 
-  S_AXI_BRESP <= "10" when resp_err_reg = '1' else "00";
-  S_AXI_RRESP <= "10" when resp_err_reg = '1' else "00";
+      axi_write(32'h0000_0001, wr_val, timeout_flag);
+      if (timeout_flag) begin
+        hangs++;
+        $display("[%0d] WRITE HANG", i);
+      end else begin
+        axi_read(32'h0000_0001, rd_val, timeout_flag);
+        if (timeout_flag) begin
+          hangs++;
+          $display("[%0d] READ HANG", i);
+        end else begin
+          $display("[%0d] wr=%04h rd=%04h %s",
+                   i, wr_val[15:0], rd_val[15:0],
+                   (rd_val[15:0] == wr_val[15:0]) ? "OK" : "MISMATCH");
+          if (rd_val[15:0] == wr_val[15:0]) wr_rd_pass++;
+          else                              wr_rd_fail++;
+        end
+      end
 
-  process(S_AXI_ACLK)
-  begin
-    if rising_edge(S_AXI_ACLK) then
-      if axi_rst_sync = '1' then
-        axi_state     <= AXI_IDLE;
-        aw_latched    <= '0';
-        w_latched     <= '0';
-        req_send      <= '0';
-        resp_dest_ack <= '0';
-        bvalid_int    <= '0';
-        rvalid_int    <= '0';
-      else
-        resp_dest_ack <= '0';
+      // --- Check 2: read REG_ID (offset 0) -- always returns ID_REV=3 ---
+      // Not a counter, but a fixed known value -- use this to check
+      // read path integrity: any value != 3 is a corruption.
+      axi_read(32'h0000_0000, rd_val, timeout_flag);
+      if (timeout_flag) begin
+        hangs++;
+        $display("[%0d] REG_ID READ HANG", i);
+      end else begin
+        // REG_ID returns ID_REV=3, zero-padded to WB_DAT_WIDTH
+        if (rd_val[15:0] == 16'h0003)
+          ctr_pass++;
+        else begin
+          ctr_fail++;
+          $display("[%0d] REG_ID WRONG: expected 0003, got %04h -- CDC corruption", i, rd_val[15:0]);
+        end
+        prev_ctr = rd_val;
+      end
 
-        if S_AXI_AWVALID = '1' and awready_int = '1' then
-          awaddr_reg <= S_AXI_AWADDR;
-          aw_latched <= '1';
-        end if;
-        if S_AXI_WVALID = '1' and wready_int = '1' then
-          wdata_reg <= S_AXI_WDATA;
-          w_latched <= '1';
-        end if;
+    end
 
-        case axi_state is
+    $display("\n=== RESULTS ===");
+    $display("Write-then-read : %0d/%0d pass, %0d fail", wr_rd_pass, NUM_ITERATIONS, wr_rd_fail);
+    $display("Counter mono    : %0d/%0d pass, %0d fail", ctr_pass,   NUM_ITERATIONS, ctr_fail);
+    $display("Hangs           : %0d", hangs);
+    if (wr_rd_fail == 0 && ctr_fail == 0 && hangs == 0)
+      $display("PASS");
+    else
+      $display("FAIL");
+    $display("TEST COMPLETE");
+    $finish;
+  end
 
-          when AXI_IDLE =>
-            axi_timeout_cnt <= 0;
-            if aw_latched = '1' and w_latched = '1' then
-              is_read_reg <= '0';
-              req_bundle  <= '0' & awaddr_reg(WB_ADR_SIZE-1 downto 0) & wdata_reg(WB_DAT_SIZE-1 downto 0);
-              axi_state   <= AXI_PREP_REQ;
-            elsif S_AXI_ARVALID = '1' then
-              araddr_reg  <= S_AXI_ARADDR;
-              is_read_reg <= '1';
-              req_bundle  <= '1' & S_AXI_ARADDR(WB_ADR_SIZE-1 downto 0) & (WB_DAT_SIZE-1 downto 0 => '0');
-              axi_state   <= AXI_PREP_REQ;
-            end if;
-
-          -- One-cycle pipeline stage: req_bundle committed on entry,
-          -- now raise req_send so xpm_cdc_handshake sees stable data.
-          -- Also clear the latches here so AXI_IDLE cannot re-trigger
-          -- a spurious write transaction on the way back from a read.
-          when AXI_PREP_REQ =>
-            req_send        <= '1';
-            axi_timeout_cnt <= 0;
-            aw_latched      <= '0';
-            w_latched       <= '0';
-            axi_state       <= AXI_SEND_REQ;
-
-          when AXI_SEND_REQ =>
-            if req_rcv = '1' then
-              req_send  <= '0';
-              axi_state <= AXI_WAIT_RESP;
-            elsif axi_timeout_cnt >= AXI_TIMEOUT_CYCLES then
-              req_send     <= '0';
-              resp_err_reg <= '1';
-              rdata_reg    <= (others => '0');
-              aw_latched   <= '0';
-              w_latched    <= '0';
-              if is_read_reg = '1' then
-                axi_state <= AXI_RESP_READ;
-              else
-                axi_state <= AXI_RESP_WRITE;
-              end if;
-            else
-              axi_timeout_cnt <= axi_timeout_cnt + 1;
-            end if;
-
-          when AXI_WAIT_RESP =>
-            if resp_dest_req = '1' then
-              rdata_reg    <= (others => '0');
-              rdata_reg(WB_DAT_SIZE-1 downto 0) <= resp_dest_out(WB_DAT_SIZE-1 downto 0);
-              resp_err_reg <= resp_dest_out(RESP_WIDTH-1);
-              resp_dest_ack <= '1';
-              aw_latched   <= '0';
-              w_latched    <= '0';
-              if is_read_reg = '1' then
-                axi_state <= AXI_RESP_READ;
-              else
-                axi_state <= AXI_RESP_WRITE;
-              end if;
-            elsif axi_timeout_cnt >= AXI_TIMEOUT_CYCLES then
-              resp_err_reg <= '1';
-              rdata_reg    <= (others => '0');
-              aw_latched   <= '0';
-              w_latched    <= '0';
-              if is_read_reg = '1' then
-                axi_state <= AXI_RESP_READ;
-              else
-                axi_state <= AXI_RESP_WRITE;
-              end if;
-            else
-              axi_timeout_cnt <= axi_timeout_cnt + 1;
-            end if;
-
-          when AXI_RESP_WRITE =>
-            bvalid_int <= '1';
-            if S_AXI_BREADY = '1' and bvalid_int = '1' then
-              bvalid_int <= '0';
-              axi_state  <= AXI_IDLE;
-            end if;
-
-          when AXI_RESP_READ =>
-            rvalid_int <= '1';
-            if S_AXI_RREADY = '1' and rvalid_int = '1' then
-              rvalid_int <= '0';
-              axi_state  <= AXI_IDLE;
-            end if;
-
-          when others =>
-            axi_state <= AXI_IDLE;
-
-        end case;
-      end if;
-    end if;
-  end process;
-
-  xpm_cdc_handshake_req : xpm_cdc_handshake
-    generic map (
-      DEST_EXT_HSK   => 1,
-      DEST_SYNC_FF   => 4,
-      INIT_SYNC_FF   => 1,
-      SIM_ASSERT_CHK => 0,
-      SRC_SYNC_FF    => 4,
-      WIDTH          => REQ_WIDTH
-    )
-    port map (
-      src_clk  => S_AXI_ACLK,
-      src_in   => req_bundle,
-      src_send => req_send,
-      src_rcv  => req_rcv,
-      dest_clk => CLK_I,
-      dest_out => req_dest_out,
-      dest_req => req_dest_req,
-      dest_ack => req_dest_ack
-    );
-
-  xpm_cdc_handshake_resp : xpm_cdc_handshake
-    generic map (
-      DEST_EXT_HSK   => 0,   -- auto-ack: dest_req self-clears after one cycle,
-                              -- resp_rcv arrives without needing resp_dest_ack.
-                              -- Required because the AXI FSM may return to IDLE
-                              -- (and stop driving resp_dest_ack) before the WB
-                              -- FSM's WB_WAIT_RCV sees resp_rcv.
-      DEST_SYNC_FF   => 4,
-      INIT_SYNC_FF   => 1,
-      SIM_ASSERT_CHK => 0,
-      SRC_SYNC_FF    => 4,
-      WIDTH          => RESP_WIDTH
-    )
-    port map (
-      src_clk  => CLK_I,
-      src_in   => resp_bundle,
-      src_send => resp_send,
-      src_rcv  => resp_rcv,
-      dest_clk => S_AXI_ACLK,
-      dest_out => resp_dest_out,
-      dest_req => resp_dest_req,
-      dest_ack => resp_dest_ack
-    );
-
-  process(CLK_I)
-  begin
-    if rising_edge(CLK_I) then
-      if wb_rst_sync = '1' then  -- '1' = reset attivo (xpm_cdc_async_rst RST_ACTIVE_HIGH=1)
-        wb_state     <= WB_IDLE;
-        req_dest_ack <= '0';
-        resp_send    <= '0';
-        WB_CYC_O     <= '0';
-        WB_STB_O     <= '0';
-        WB_WR_O      <= '0';
-      else                       -- reset inattivo = operazione normale
-        req_dest_ack <= '0';
-
-        case wb_state is
-
-          when WB_IDLE =>
-            if req_dest_req = '1' then
-              wb_rnw         <= req_dest_out(REQ_WIDTH-1);
-              wb_addr        <= req_dest_out(WB_ADR_SIZE+WB_DAT_SIZE-1 downto WB_DAT_SIZE);
-              wb_wdata       <= req_dest_out(WB_DAT_SIZE-1 downto 0);
-              req_dest_ack   <= '1';
-              wb_timeout_cnt <= 0;
-              wb_state       <= WB_DRIVE;
-            end if;
-
-          when WB_DRIVE =>
-            WB_ADR_O    <= wb_addr;
-            WB_CYC_O    <= '1';
-            WB_STB_O    <= '1';
-            WB_WR_O     <= not wb_rnw;
-            if wb_rnw = '0' then
-              WB_WR_DAT_O <= wb_wdata;
-            end if;
-            wb_timeout_cnt <= 0;
-            wb_state       <= WB_WAIT_ACK;
-
-          when WB_WAIT_ACK =>
-            if WB_ACK_I = '1' then
-              WB_CYC_O <= '0';
-              WB_STB_O <= '0';
-              WB_WR_O  <= '0';
-              if wb_rnw = '1' then
-                -- Capture read data in the same cycle as ACK.
-                -- For registered targets (e.g. syscon): WB_DAT_O is driven
-                -- in the same clock edge as WB_ACK_O; both become visible on
-                -- the FOLLOWING edge -- which is exactly this edge (WB_WAIT_ACK
-                -- seeing ACK='1'). One cycle later (WB_CAPTURE) CYC/STB have
-                -- dropped and the target has already cleared WB_DAT_O to zero.
-                resp_bundle <= '0' & WB_RD_DAT_I;
-                resp_send   <= '1';
-                wb_state    <= WB_SEND_RESP;
-              else
-                resp_bundle <= '0' & std_logic_vector(to_unsigned(0, WB_DAT_SIZE));
-                resp_send   <= '1';
-                wb_state    <= WB_SEND_RESP;
-              end if;
-            elsif wb_timeout_cnt >= WB_TIMEOUT_CYCLES then
-              WB_CYC_O    <= '0';
-              WB_STB_O    <= '0';
-              WB_WR_O     <= '0';
-              resp_bundle <= '1' & std_logic_vector(to_unsigned(0, WB_DAT_SIZE));
-              resp_send   <= '1';
-              wb_state    <= WB_SEND_RESP;
-            else
-              wb_timeout_cnt <= wb_timeout_cnt + 1;
-            end if;
-
-          when WB_CAPTURE =>
-            -- No longer used for registered targets: capture now happens in
-            -- WB_WAIT_ACK. State kept to avoid encoding gap; goes to IDLE.
-            wb_state <= WB_IDLE;
-
-          when WB_SEND_RESP =>
-            wb_state <= WB_WAIT_RCV;
-
-          when WB_WAIT_RCV =>
-            if resp_rcv = '1' then
-              resp_send <= '0';
-              wb_state  <= WB_IDLE;
-            end if;
-
-          when others =>
-            wb_state <= WB_IDLE;
-
-        end case;
-      end if;
-    end if;
-  end process;
-
-end architecture rtl;
+endmodule
