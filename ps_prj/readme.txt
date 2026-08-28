@@ -31,6 +31,7 @@ import sys
 import signal
 import time
 import random
+import ctypes
 from datetime import datetime
 
 pass_count   = 0
@@ -57,12 +58,12 @@ def enable_device(resource_path):
         print(f"WARNING: could not enable device ({e}) -- continuing anyway")
 
 def read_reg(mm, offset):
-    mm.seek(offset)
-    return struct.unpack('<H', mm.read(2))[0]
+    addr = ctypes.addressof(ctypes.c_char.from_buffer(mm)) + offset
+    return ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint16))[0]
 
 def write_reg(mm, offset, value):
-    mm.seek(offset)
-    mm.write(struct.pack('<H', value))
+    addr = ctypes.addressof(ctypes.c_char.from_buffer(mm)) + offset
+    ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint16))[0] = value
 
 def _print_summary():
     elapsed = time.monotonic() - start_time
