@@ -2,12 +2,11 @@
 # flash_ax7103.sh
 #
 # Programs the N25Q128 QSPI flash on the ALINX AX7103.
-# Finds the .bit file in the same directory as this script,
-# generates the MCS, then launches Vivado in batch mode to program flash.
+# Finds the .bit file in the same directory as this script.
 #
 # Usage:
-#   chmod +x flash_ax7103.sh
-#   ./flash_ax7103.sh
+#   source /opt/Xilinx/Vivado/2023.1/settings64.sh
+#   chmod +x flash_ax7103.sh && ./flash_ax7103.sh
 
 set -e
 
@@ -17,12 +16,10 @@ FLASH_PART="mt25ql128-spi-x1_x2_x4"
 # --- Find .bit file ---
 BIT_FILES=("$SCRIPT_DIR"/*.bit)
 if [[ ${#BIT_FILES[@]} -eq 0 || ! -f "${BIT_FILES[0]}" ]]; then
-    echo "ERROR: No .bit file found in $SCRIPT_DIR"
-    exit 1
+    echo "ERROR: No .bit file found in $SCRIPT_DIR"; exit 1
 elif [[ ${#BIT_FILES[@]} -gt 1 ]]; then
     echo "ERROR: Multiple .bit files found -- leave only one:"
-    printf '  %s\n' "${BIT_FILES[@]}"
-    exit 1
+    printf '  %s\n' "${BIT_FILES[@]}"; exit 1
 fi
 
 BIT_FILE="${BIT_FILES[0]}"
@@ -35,18 +32,14 @@ echo "MCS       : $MCS_FILE"
 echo "Flash     : $FLASH_PART"
 echo ""
 
-# --- Check Vivado is on PATH ---
+# --- Check Vivado ---
 if ! command -v vivado &>/dev/null; then
-    echo "ERROR: vivado not found on PATH."
-    echo "Source your Vivado settings first:"
-    echo "  source /opt/Xilinx/Vivado/2023.1/settings64.sh"
-    exit 1
+    echo "ERROR: vivado not found. Source settings64.sh first."; exit 1
 fi
 
-# --- Launch Vivado batch mode with inline Tcl ---
+# --- Step 1: Generate MCS (separate Vivado batch call) ---
+echo "Generating MCS..."
 vivado -mode batch -nojournal -nolog -source /dev/stdin << TCLEOF
-
-# --- Generate MCS ---
 write_cfgmem \
     -format    mcs   \
     -interface spix4 \
@@ -54,8 +47,20 @@ write_cfgmem \
     -loadbit   "up 0x0 {$BIT_FILE}" \
     -file      {$MCS_FILE} \
     -force
+puts "write_cfgmem done."
+TCLEOF
 
-# --- Open hardware ---
+# Verify MCS was created
+if [[ ! -f "$MCS_FILE" ]]; then
+    echo "ERROR: MCS file was not generated: $MCS_FILE"; exit 1
+fi
+echo "MCS generated OK: $MCS_FILE"
+echo ""
+
+# --- Step 2: Program FPGA then flash (separate Vivado batch call) ---
+echo "Programming FPGA and flash..."
+vivado -mode batch -nojournal -nolog -source /dev/stdin << TCLEOF
+
 open_hw_manager
 connect_hw_server -allow_non_jtag
 open_hw_target
@@ -64,14 +69,14 @@ set dev [lindex [get_hw_devices] 0]
 current_hw_device \$dev
 puts "Device: \$dev"
 
-# --- Program FPGA first ---
+# Program FPGA first so Vivado can use it as SPI bridge
 puts "Programming FPGA..."
 set_property PROGRAM.FILE {$BIT_FILE} \$dev
 program_hw_devices \$dev
 refresh_hw_device \$dev
 puts "FPGA programmed OK."
 
-# --- Use the cfgmem Vivado auto-created after program_hw_devices ---
+# Use cfgmem auto-created by Vivado, or create one if needed
 set cfgmem [get_property PROGRAM.HW_CFGMEM \$dev]
 if {\$cfgmem eq ""} {
     puts "Creating cfgmem..."
@@ -92,12 +97,11 @@ set_property PROGRAM.CHECKSUM    0               \$cfgmem
 
 puts "Programming flash (~2 min)..."
 program_hw_cfgmem -hw_cfgmem \$cfgmem
-
 puts "Flash programming complete."
+
 close_hw_target
 disconnect_hw_server
 close_hw_manager
-
 TCLEOF
 
 echo ""
