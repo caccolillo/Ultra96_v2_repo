@@ -1,7 +1,7 @@
 # flash_ax7103.tcl
 #
 # Programs the N25Q128 (mt25ql128) QSPI flash on the ALINX AX7103.
-# Automatically finds the .bit and .mcs files in the same directory.
+# Automatically finds the .bit file in the same directory as this script.
 #
 # Usage -- from Vivado Tcl console:
 #   source /path/to/flash_ax7103.tcl
@@ -49,18 +49,32 @@ refresh_hw_device $dev
 puts "FPGA programmed OK."
 
 # --- Step 4: Program flash ---
+# Delete any existing cfgmem association before creating a new one
+if {[llength [get_hw_cfgmems]] > 0} {
+    delete_hw_cfgmem [get_hw_cfgmems]
+}
+
 startgroup
 create_hw_cfgmem \
     -hw_device $dev \
     -mem_dev   [lindex [get_cfgmem_parts $flash_part] 0]
 
 set cfgmem [get_property PROGRAM.HW_CFGMEM $dev]
+
 set_property PROGRAM.FILES       [list $mcs_file] $cfgmem
-set_property PROGRAM.PRM_FILES   [list $prm_file] $cfgmem
 set_property PROGRAM.ERASE       1                $cfgmem
 set_property PROGRAM.CFG_PROGRAM 1                $cfgmem
 set_property PROGRAM.VERIFY      1                $cfgmem
 set_property PROGRAM.CHECKSUM    0                $cfgmem
+
+# Only set PRM file if it was generated and is non-empty
+if {[file exists $prm_file] && [file size $prm_file] > 0} {
+    puts "PRM file found: $prm_file"
+    set_property PROGRAM.PRM_FILES [list $prm_file] $cfgmem
+} else {
+    puts "No PRM file -- skipping (normal for SPIx4 single bitstream)"
+    set_property PROGRAM.PRM_FILES {} $cfgmem
+}
 endgroup
 
 puts "Programming flash (~2 min)..."
