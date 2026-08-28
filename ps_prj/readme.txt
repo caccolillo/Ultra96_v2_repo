@@ -1,22 +1,27 @@
-
 #!/usr/bin/env python3
 """
 reg_rw_test.py -- write-then-read integrity test for a PCIe BAR register.
 
 Writes a random 16-bit value to a register, reads it back, and verifies
 the value matches. Repeats in a loop, printing a summary line per iteration.
-Designed to verify the AXI4-Lite -> Wishbone bridge is working correctly
-on real hardware after the simulation was validated.
-
-Target register: REG_DSP_ALIVE (syscon offset 1, byte address 0x0002)
-This is the cleanest r/w register in syscon -- no side effects, no
-inversion, direct write/read of dsp_alive_reg.
 
 Usage:
-    sudo python3 reg_rw_test.py /sys/bus/pci/devices/0000:01:00.0/resource0 [iterations] [delay_s]
+    sudo python3 reg_rw_test.py <resource_path> <byte_offset_hex> [iterations] [delay_s]
 
-    iterations  -- number of write/read cycles (default: 200, 0 = infinite)
-    delay_s     -- seconds between iterations (default: 0.01)
+    resource_path    : e.g. /sys/bus/pci/devices/0000:01:00.0/resource0
+    byte_offset_hex  : byte address of the register, e.g. 0x0080
+    iterations       : number of write/read cycles (default: 200, 0 = infinite)
+    delay_s          : pause between iterations in seconds (default: 0.01)
+
+Examples:
+    # DSP_ALIVE alias 0x0040, byte offset 0x0080
+    sudo python3 reg_rw_test.py /sys/bus/pci/devices/0000:01:00.0/resource0 0x0080
+
+    # FPGA_ALIVE alias 0x0000, byte offset 0x0000 (read-only, will always fail write-back)
+    sudo python3 reg_rw_test.py /sys/bus/pci/devices/0000:01:00.0/resource0 0x0000
+
+    # Infinite loop, no delay
+    sudo python3 reg_rw_test.py /sys/bus/pci/devices/0000:01:00.0/resource0 0x0080 0 0
 """
 
 import mmap
@@ -28,13 +33,11 @@ import time
 import random
 from datetime import datetime
 
-# Byte address of DSP_ALIVE (alias register 0x0040, 16-bit -> byte offset 0x0080)
-DEFAULT_REG_BYTE_OFFSET = 0x0080
-
-pass_count    = 0
-fail_count    = 0
-sigbus_count  = 0
-total_count   = 0
+pass_count   = 0
+fail_count   = 0
+sigbus_count = 0
+total_count  = 0
+start_time   = 0.0
 
 def sigbus_handler(signum, frame):
     global sigbus_count
@@ -74,17 +77,14 @@ def _print_summary():
 def main():
     global pass_count, fail_count, total_count, start_time
 
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <resource_path> [iterations] [delay_s]")
-        print(f"  resource_path : e.g. /sys/bus/pci/devices/0000:01:00.0/resource0")
-        print(f"  iterations    : number of cycles, 0 = infinite (default: 200)")
-        print(f"  delay_s       : pause between cycles in seconds (default: 0.01)")
+    if len(sys.argv) < 3:
+        print(__doc__)
         sys.exit(1)
 
     resource_path = sys.argv[1]
-    iterations    = int(sys.argv[2])   if len(sys.argv) > 2 else 200
-    delay         = float(sys.argv[3]) if len(sys.argv) > 3 else 0.01
-    offset        = DEFAULT_REG_BYTE_OFFSET
+    offset        = int(sys.argv[2], 16)
+    iterations    = int(sys.argv[3])   if len(sys.argv) > 3 else 200
+    delay         = float(sys.argv[4]) if len(sys.argv) > 4 else 0.01
     infinite      = (iterations == 0)
 
     signal.signal(signal.SIGBUS, sigbus_handler)
@@ -96,12 +96,12 @@ def main():
                          mmap.PROT_READ | mmap.PROT_WRITE)
 
     print(f"BAR      : {resource_path}")
-    print(f"Offset   : 0x{offset:04x}  (DSP_ALIVE, alias 0x0040)")
+    print(f"Offset   : 0x{offset:04x}")
     print(f"Cycles   : {'infinite' if infinite else iterations}")
     print(f"Delay    : {delay}s")
     print()
     print(f"{'#':>6}  {'Written':>8}  {'Read':>8}  {'Result'}")
-    print("-" * 40)
+    print("-" * 50)
 
     start_time = time.monotonic()
     i = 0
@@ -111,19 +111,13 @@ def main():
             i += 1
             total_count = i
 
-            # Save original value before overwriting
             original = read_reg(mm, offset)
 
-            # Write random 16-bit value (avoid 0x0000 to distinguish from
-            # reset state, and avoid 0xFFFF which indicates a PCIe error)
+            # Random 16-bit value, avoid 0x0000 and 0xFFFF
             wr_val = random.randint(1, 0xFFFE)
             write_reg(mm, offset, wr_val)
 
-            # Small pause to let the write commit through the bridge --
-            # in practice the PCIe posted write + WB cycle completes well
-            # within a millisecond, but a tiny sleep makes the test robust
-            # against any unexpected latency on the host path
-            time.sleep(0.001)
+            time.sleep(0.001)  # let the write commit through the bridge
 
             rd_val = read_reg(mm, offset)
 
@@ -137,12 +131,11 @@ def main():
 
             print(f"{i:>6}  0x{wr_val:04x}    0x{rd_val:04x}    {result}")
 
-            # Restore original value so the register state is predictable
-            # across repeated runs
+            # Restore original value
             write_reg(mm, offset, original)
 
             if fail_count >= 10:
-                print("\nStopping after 10 consecutive-or-total failures.")
+                print("\nStopping after 10 failures.")
                 break
 
             if delay > 0:
