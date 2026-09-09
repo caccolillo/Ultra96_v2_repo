@@ -577,7 +577,7 @@ module tb_radio_link_1wire_pat6570;
     // Watchdog  — prevents infinite run if WB ack never arrives
     // =========================================================================
     initial begin : watchdog
-        #(10_000_000_000); // 10000 ms sim time ceiling (15 iter x 62ms settle + overhead)
+        #(64'd10_000_000_000); // 10000 ms sim time ceiling (15 iter x 62ms settle + overhead)
         $display("WATCHDOG TIMEOUT at %0t us -- increase timeout or reduce NUM_REBOOT_ITER", $time/1000);
         $finish;
     end : watchdog
