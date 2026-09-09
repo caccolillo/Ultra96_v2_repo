@@ -86,8 +86,8 @@ module tb_radio_link_1wire_pat6570;
     logic clk   = 1'b0;
     always #(CLK_PERIOD_NS / 2.0) clk = ~clk;
 
-    logic rst_a = 1'b1;
-    logic rst_b = 1'b1;
+    logic rst_a = 1'b0;  // start deasserted; reset_both() asserts when needed
+    logic rst_b = 1'b0;
 
     // =========================================================================
     // Open-drain bus
@@ -181,13 +181,15 @@ module tb_radio_link_1wire_pat6570;
 
     task automatic wb_write_a (input logic [2:0] reg_off,
                                 input logic [WB_DAT_W-1:0] data);
-        @(negedge clk);          // drive on falling edge — stable before next rising
+        // Wait until DUT_A is out of reset
+        while (rst_a) @(posedge clk);
+        @(negedge clk);
         a_adr  = reg_off;
         a_wdat = data;
         a_we   = 1'b1;
         a_stb  = 1'b1;
         a_cyc  = 1'b1;
-        @(posedge clk);          // ack registered one clock after STB+CYC high
+        @(posedge clk);
         while (!a_ack) @(posedge clk);
         @(negedge clk);
         a_stb  = 1'b0;
@@ -198,6 +200,7 @@ module tb_radio_link_1wire_pat6570;
 
     task automatic wb_read_a (input  logic [2:0] reg_off,
                                output logic [WB_DAT_W-1:0] data);
+        while (rst_a) @(posedge clk);
         @(negedge clk);
         a_adr  = reg_off;
         a_we   = 1'b0;
@@ -214,6 +217,7 @@ module tb_radio_link_1wire_pat6570;
 
     task automatic wb_write_b (input logic [2:0] reg_off,
                                 input logic [WB_DAT_W-1:0] data);
+        while (rst_b) @(posedge clk);
         @(negedge clk);
         b_adr  = reg_off;
         b_wdat = data;
@@ -231,6 +235,7 @@ module tb_radio_link_1wire_pat6570;
 
     task automatic wb_read_b (input  logic [2:0] reg_off,
                                output logic [WB_DAT_W-1:0] data);
+        while (rst_b) @(posedge clk);
         @(negedge clk);
         b_adr  = reg_off;
         b_we   = 1'b0;
@@ -264,21 +269,30 @@ module tb_radio_link_1wire_pat6570;
     // =========================================================================
 
     task automatic reset_both ();
-        rst_a <= 1'b1; rst_b <= 1'b1;
-        repeat (8) @(posedge clk);
-        rst_a <= 1'b0; rst_b <= 1'b0;
+        @(negedge clk);
+        rst_a = 1'b1; rst_b = 1'b1;
+        repeat (16) @(posedge clk);  // hold reset for 16 cycles
+        @(negedge clk);
+        rst_a = 1'b0; rst_b = 1'b0;
+        repeat (4) @(posedge clk);   // let DUTs come out of reset cleanly
     endtask
 
     task automatic reset_a_only ();
-        rst_a <= 1'b1;
-        repeat (8) @(posedge clk);
-        rst_a <= 1'b0;
+        @(negedge clk);
+        rst_a = 1'b1;
+        repeat (16) @(posedge clk);
+        @(negedge clk);
+        rst_a = 1'b0;
+        repeat (4) @(posedge clk);
     endtask
 
     task automatic reset_b_only ();
-        rst_b <= 1'b1;
-        repeat (8) @(posedge clk);
-        rst_b <= 1'b0;
+        @(negedge clk);
+        rst_b = 1'b1;
+        repeat (16) @(posedge clk);
+        @(negedge clk);
+        rst_b = 1'b0;
+        repeat (4) @(posedge clk);
     endtask
 
     // =========================================================================
@@ -385,6 +399,21 @@ module tb_radio_link_1wire_pat6570;
 
         int iter;
         logic reboot_a;
+
+        // Deassert all WB signals
+        a_stb = 1'b0; a_cyc = 1'b0; a_we = 1'b0;
+        b_stb = 1'b0; b_cyc = 1'b0; b_we = 1'b0;
+
+        // Assert reset immediately at time 0 so divisor_reg and all
+        // internal registers get initialised to their DEFAULT values.
+        // Without this, divisor_reg stays 0 => Uart16xBaudEn stuck high.
+        rst_a = 1'b1;
+        rst_b = 1'b1;
+        repeat (32) @(posedge clk);   // hold reset for 32 cycles
+        @(negedge clk);
+        rst_a = 1'b0;
+        rst_b = 1'b0;
+        repeat (8) @(posedge clk);    // settle before first WB access
 
         $display("=============================================================");
         $display("TB  PAT6-570  1-Wire Link Negotiation Failure Reproduction");
