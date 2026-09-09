@@ -336,9 +336,11 @@ module tb_radio_link_1wire_pat6570;
                  chk_prs_b[7:0], chk_prb_b[7:0],
                  chk_rs_b[7:0],  chk_rb_b[7:0]);
 
-        // Skip check if link not yet established on either side
-        if (chk_rs_a[7:0] == ST_NO_LINK || chk_rs_b[7:0] == ST_NO_LINK) begin
-            $display("  SKIP  (link not established)");
+        // Skip only when BOTH radios show no link (0x00)
+        // A single radio showing 0x00 after reboot is the failure condition
+        // we are trying to catch, not a reason to skip
+        if (chk_rs_a[7:0] == ST_NO_LINK && chk_rs_b[7:0] == ST_NO_LINK) begin
+            $display("  SKIP  (neither radio has link state)");
         end else begin
 
             // [1] A.PRS == B.RS
@@ -411,9 +413,17 @@ module tb_radio_link_1wire_pat6570;
 
     initial begin : test_main
 
-        // Deassert all WB signals
-        a_stb = 1'b0; a_cyc = 1'b0; a_we = 1'b0;
-        b_stb = 1'b0; b_cyc = 1'b0; b_we = 1'b0;
+        // Deassert all WB signals and initialise to known state
+        a_adr  = 3'h0;
+        a_wdat = 16'h0000;
+        a_stb  = 1'b0;
+        a_cyc  = 1'b0;
+        a_we   = 1'b0;
+        b_adr  = 3'h0;
+        b_wdat = 16'h0000;
+        b_stb  = 1'b0;
+        b_cyc  = 1'b0;
+        b_we   = 1'b0;
 
         // Assert reset immediately at time 0 so divisor_reg and all
         // internal registers get initialised to their DEFAULT values.
