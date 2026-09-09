@@ -286,6 +286,8 @@ module tb_radio_link_1wire_pat6570;
         @(negedge clk);
         rst_a = 1'b0; rst_b = 1'b0;
         repeat (4) @(posedge clk);   // let DUTs come out of reset cleanly
+        wb_write_a(REG_DIV, 16'd5); // restore fast divisor (reset clears to DEFAULT_DIVISOR=520)
+        wb_write_b(REG_DIV, 16'd5);
     endtask
 
     task automatic reset_a_only ();
@@ -295,6 +297,7 @@ module tb_radio_link_1wire_pat6570;
         @(negedge clk);
         rst_a = 1'b0;
         repeat (4) @(posedge clk);
+        wb_write_a(REG_DIV, 16'd5); // restore fast divisor after reset
     endtask
 
     task automatic reset_b_only ();
@@ -304,6 +307,7 @@ module tb_radio_link_1wire_pat6570;
         @(negedge clk);
         rst_b = 1'b0;
         repeat (4) @(posedge clk);
+        wb_write_b(REG_DIV, 16'd5); // restore fast divisor after reset
     endtask
 
     // =========================================================================
@@ -435,6 +439,11 @@ module tb_radio_link_1wire_pat6570;
         rst_a = 1'b0;
         rst_b = 1'b0;
         repeat (8) @(posedge clk);    // settle before first WB access
+        // Override baud divisor via Wishbone — generic override may not
+        // cross the mixed-language boundary correctly in ModelSim.
+        // Reset reloads DEFAULT_DIVISOR=520; writing 5 here gives 104x speedup.
+        wb_write_a(REG_DIV, 16'd5);
+        wb_write_b(REG_DIV, 16'd5);
 
         $display("=============================================================");
         $display("TB  PAT6-570  1-Wire Link Negotiation Failure Reproduction");
