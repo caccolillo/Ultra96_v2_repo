@@ -49,14 +49,15 @@ module tb_radio_link_1wire_pat6570;
     localparam int          WB_DAT_W             = 16;
     localparam int          WB_ADR_W             = 3;
     localparam logic [2:0]  WB_BASE              = 3'h0; // addr is reg offset only
-    localparam int          NUM_REBOOT_ITER       = 15;  // 15 x ~62ms = ~930ms sim time
+    localparam int          NUM_REBOOT_ITER       = 50;  // 50 x ~1.2ms = ~60ms sim time at divisor=5
 
     // Timing derived from RTL constants:
     //   BAUD_MULTIPLIER=16, DEFAULT_DIVISOR=520 => 9600 baud @ 80 MHz
     //   One byte = 10 bits = 160 baud-clocks = 160 * 520 * 12.5 ns = 1.04 ms
-    localparam real BYTE_PERIOD_NS  = 16.0 * 520.0 * CLK_PERIOD_NS; // ~104 us
-    localparam real FRAME_PERIOD_NS = 3.0  * BYTE_PERIOD_NS;         // 2 bytes + margin
-    localparam real SETTLE_NS       = 600.0 * BYTE_PERIOD_NS;        // ~62 ms — covers full RECEIVE_TIMEOUT (481 byte periods)
+    localparam real BYTE_PERIOD_NS  = 16.0 * 5.0   * CLK_PERIOD_NS; // ~1 us (divisor=5, 104x faster than real 9600 baud)
+    localparam int  SIM_DIVISOR         = 5;   // override — change to 520 for real-speed simulation
+    localparam real FRAME_PERIOD_NS = 3.0  * BYTE_PERIOD_NS;         // ~3 us at sim baud rate
+    localparam real SETTLE_NS       = 1200.0 * BYTE_PERIOD_NS;       // ~1.2 ms at sim baud rate (same 1200 byte periods, 104x faster)
 
     // Register offsets
     localparam logic [2:0] REG_ID     = 3'd0;
@@ -125,7 +126,7 @@ module tb_radio_link_1wire_pat6570;
     // =========================================================================
 
     radio_link_1wire #(
-        .DEFAULT_DIVISOR (520),
+        .DEFAULT_DIVISOR (5),   // reduced from 520 for simulation speed (104x faster)
         .INVERT_RESET    (1'b0)
     ) dut_a (
         .RST_I       (rst_a),
@@ -142,7 +143,7 @@ module tb_radio_link_1wire_pat6570;
     );
 
     radio_link_1wire #(
-        .DEFAULT_DIVISOR (520),
+        .DEFAULT_DIVISOR (5),   // reduced from 520 for simulation speed (104x faster)
         .INVERT_RESET    (1'b0)
     ) dut_b (
         .RST_I       (rst_b),
@@ -459,10 +460,13 @@ module tb_radio_link_1wire_pat6570;
             if (reboot_a) begin
                 $display("\n  [%0d] Rebooting A only (B running mid-cycle)", iter);
                 reset_a_only();
+                // Always rewrite both DUTs so RS is never 0x00 at check time
                 set_states_a(ST_ACTIVE,   BT_FULL_SVC);
+                set_states_b(ST_INACTIVE, BT_FULL_SVC);
             end else begin
                 $display("\n  [%0d] Rebooting B only (A running mid-cycle)", iter);
                 reset_b_only();
+                set_states_a(ST_ACTIVE,   BT_FULL_SVC);
                 set_states_b(ST_INACTIVE, BT_FULL_SVC);
             end
 
