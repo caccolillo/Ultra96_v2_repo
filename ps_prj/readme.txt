@@ -15,7 +15,7 @@
 //   Open-drain bus: wired-AND of both TX outputs (active-low).
 //   Any DUT pulling low dominates. Each DUT's RX_I sees the shared bus.
 //
-// Wishbone address: (WB_STB_1_WIRE=5) << 8 | reg_offset = 0x0500 | offset
+// Wishbone address: WB_ADR_I is 3 bits = register offset only (block selected externally)
 //
 // Register offsets
 //   0 = REG_ID                  (read: ID_REV)
@@ -47,8 +47,8 @@ module tb_radio_link_1wire_pat6570;
 
     localparam real         CLK_PERIOD_NS        = 12.5;   // 80 MHz
     localparam int          WB_DAT_W             = 16;
-    localparam int          WB_ADR_W             = 15;
-    localparam logic [14:0] WB_BASE              = 15'h0500;
+    localparam int          WB_ADR_W             = 3;
+    localparam logic [2:0]  WB_BASE              = 3'h0; // addr is reg offset only
     localparam int          NUM_REBOOT_ITER       = 50;
 
     // Timing derived from RTL constants:
@@ -182,7 +182,7 @@ module tb_radio_link_1wire_pat6570;
     task automatic wb_write_a (input logic [2:0] reg_off,
                                 input logic [WB_DAT_W-1:0] data);
         @(posedge clk);
-        a_adr  <= WB_BASE | {{(WB_ADR_W-3){1'b0}}, reg_off};
+        a_adr  <= reg_off;
         a_wdat <= data;
         a_we   <= 1'b1;
         a_stb  <= 1'b1;
@@ -198,7 +198,7 @@ module tb_radio_link_1wire_pat6570;
     task automatic wb_read_a (input  logic [2:0] reg_off,
                                output logic [WB_DAT_W-1:0] data);
         @(posedge clk);
-        a_adr  <= WB_BASE | {{(WB_ADR_W-3){1'b0}}, reg_off};
+        a_adr  <= reg_off;
         a_we   <= 1'b0;
         a_stb  <= 1'b1;
         a_cyc  <= 1'b1;
@@ -213,7 +213,7 @@ module tb_radio_link_1wire_pat6570;
     task automatic wb_write_b (input logic [2:0] reg_off,
                                 input logic [WB_DAT_W-1:0] data);
         @(posedge clk);
-        b_adr  <= WB_BASE | {{(WB_ADR_W-3){1'b0}}, reg_off};
+        b_adr  <= reg_off;
         b_wdat <= data;
         b_we   <= 1'b1;
         b_stb  <= 1'b1;
@@ -229,7 +229,7 @@ module tb_radio_link_1wire_pat6570;
     task automatic wb_read_b (input  logic [2:0] reg_off,
                                output logic [WB_DAT_W-1:0] data);
         @(posedge clk);
-        b_adr  <= WB_BASE | {{(WB_ADR_W-3){1'b0}}, reg_off};
+        b_adr  <= reg_off;
         b_we   <= 1'b0;
         b_stb  <= 1'b1;
         b_cyc  <= 1'b1;
@@ -545,96 +545,3 @@ module tb_radio_link_1wire_pat6570;
     end : wave_dump
 
 endmodule : tb_radio_link_1wire_pat6570
-
-
-
-
-
-
-
-
-
----------------------------------------------------------------------------------------------------------------------------
-
-Setup
-
-Two instances of radio_link_1wire — DUT_A and DUT_B — are connected together on a shared open-drain bus modelled as a wired-AND:
-
-bus = n_tx_a AND n_tx_b
-
-Both DUTs receive the same bus on their N_LINK_RX_I pin. This exactly matches the real hardware wiring. Because the bus is active-low open-drain, anything a DUT transmits also loops back into its own receive input — which is the root cause of PAT6-570.
-
-A Wishbone master in the testbench talks to each DUT independently to write state values and read back registers, exactly as the ARM processor does in the real system.
-
-TEST 1 — Clean dual power-on
-
-Both DUTs are reset together, then released at the same time. The ARM state registers are written:
-
-DUT_A: RadioState = 0x41 (Active), BitState = 0x46 (Full service)
-DUT_B: RadioState = 0x69 (Inactive), BitState = 0x46 (Full service)
-
-The testbench waits ~1 ms for the link to settle (10 UART byte periods), then reads all four paired/local registers from both DUTs and checks the four AC-TB-3 invariants:
-
-A.0x502 == B.0x504    (A's view of B's state == B's actual state)
-A.0x503 == B.0x505    (A's view of B's bit state == B's actual bit state)
-B.0x502 == A.0x504    (B's view of A's state == A's actual state)
-B.0x503 == A.0x505    (B's view of A's bit state == A's actual bit state)
-
-This establishes a baseline. With the buggy RTL, this may already fail on first run depending on timing.
-
-TEST 2 — Single-side reboot stress (50 iterations)
-
-This is the core PAT6-570 reproduction test. It loops 50 times. On even iterations it reboots DUT_A only while DUT_B keeps running; on odd iterations it reboots DUT_B only while DUT_A keeps running.
-
-Each iteration:
-
-Assert reset on one DUT for 8 clock cycles, release it
-Re-write the ARM state registers on the rebooted DUT (simulating MCP restart)
-Wait ~2 ms for re-negotiation to attempt
-Read all 8 registers (4 from each DUT) and check all 4 invariants plus two extra checks:
-
-Self-echo check: A.0x502 == A.0x505 — if A's paired radio state matches A's own bit state, A has received its own transmission and committed it as the peer's data.
-
-Byte-swap check: A.0x502 == B.0x505 and A.0x502 != B.0x504 — the state register contains the bit-state byte and vice versa, which is the exact register swap John Stevens documented in the Jira comments.
-
-With the unmodified RTL the field reports show failure within ~10 cycles. The testbench prints a FAIL line for each violation as it happens so you can see exactly which iteration triggers it and which invariant breaks first.
-
-TEST 3 — Simultaneous reboot (5 repetitions)
-
-Both DUTs are reset together 5 times with the same state values as TEST 1. This should always pass because both radios start from the same initial condition and race symmetrically. It serves as a sanity check — if this fails, something is wrong with the testbench setup rather than the RTL bug.
-
-TEST 4 — Direct self-echo detection
-
-Without any reboot, distinctive values are written to both DUTs:
-
-DUT_A: 0x41 / 0x46
-DUT_B: 0x69 / 0x52
-
-After 3 frame periods, DUT_A's paired radio state register (0x502) is read back and compared against DUT_A's own bit state register (0x505). If they match, DUT_A has self-received its own transmission — AC-RTL-1 is violated.
-
-TEST 5 — Jira check_fpga_self_rx equivalent
-
-This is a direct port of the Python test function John Stevens posted in the Jira comments on 18 August 2026. It works as follows:
-
-Both DUTs start cleanly and settle
-DUT_A only is rebooted
-The value 123 (decimal) is written to DUT_A's BitState register (0x505)
-After 5 frame periods, DUT_A's PairedRadioState register (0x502) is read back
-If A.0x502 == 123, DUT_A has self-received — its own transmitted bit state has come back through the open-drain loopback and been committed as the peer's radio state
-
-John Stevens ran this test over 40 times without the link cable connected and it passed every time. With the cable connected it failed after 3 iterations, because the cable creates the open-drain loopback path that makes self-receive possible. The testbench replicates that path in simulation.
-
-What the output looks like when the bug is present
-
-[iter 3] Rebooting DUT_A only (DUT_B running)
-  A: PRS=46h PRB=41h RS=41h RB=46h
-  B: PRS=41h PRB=46h RS=69h RB=46h
-  FAIL[1] A.PRS(502)=46h != B.RS(504)=69h
-  FAIL[5-SELF-ECHO] A.PRS(502)=46h == A.RB(505)=46h
-  FAIL[6-BYTESWAP]  A.PRS(502)=46h == B.RB(505)=46h (B.RS=69h)
-
-That output shows all three failure modes simultaneously: A's paired state register contains 0x46 (Full Service — a bit-state value), which matches A's own bit state (self-echo) and also matches B's bit state (byte-swap), when it should contain B's radio state 0x69 (Inactive).
-
-What the testbench does NOT do
-
-It does not test the fix — it only reproduces the bug. Once AC-RTL-1 through AC-RTL-4 are implemented (self-echo rejection, frame sync bytes, buffer clearing, validation gate), all five tests should pass. The testbench then becomes the regression gate that confirms the fix holds across 50 reboot cycles.
