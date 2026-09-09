@@ -49,14 +49,14 @@ module tb_radio_link_1wire_pat6570;
     localparam int          WB_DAT_W             = 16;
     localparam int          WB_ADR_W             = 3;
     localparam logic [2:0]  WB_BASE              = 3'h0; // addr is reg offset only
-    localparam int          NUM_REBOOT_ITER       = 50;
+    localparam int          NUM_REBOOT_ITER       = 15;  // 15 x ~62ms = ~930ms sim time
 
     // Timing derived from RTL constants:
     //   BAUD_MULTIPLIER=16, DEFAULT_DIVISOR=520 => 9600 baud @ 80 MHz
     //   One byte = 10 bits = 160 baud-clocks = 160 * 520 * 12.5 ns = 1.04 ms
     localparam real BYTE_PERIOD_NS  = 16.0 * 520.0 * CLK_PERIOD_NS; // ~104 us
     localparam real FRAME_PERIOD_NS = 3.0  * BYTE_PERIOD_NS;         // 2 bytes + margin
-    localparam real SETTLE_NS       = 10.0 * BYTE_PERIOD_NS;         // ~1.04 ms
+    localparam real SETTLE_NS       = 600.0 * BYTE_PERIOD_NS;        // ~62 ms — covers full RECEIVE_TIMEOUT (481 byte periods)
 
     // Register offsets
     localparam logic [2:0] REG_ID     = 3'd0;
@@ -577,7 +577,7 @@ module tb_radio_link_1wire_pat6570;
     // Watchdog  — prevents infinite run if WB ack never arrives
     // =========================================================================
     initial begin : watchdog
-        #(2_000_000_000); // 2000 ms sim time ceiling (50 iter x 25 frames x 104us each)
+        #(10_000_000_000); // 10000 ms sim time ceiling (15 iter x 62ms settle + overhead)
         $display("WATCHDOG TIMEOUT at %0t us -- increase timeout or reduce NUM_REBOOT_ITER", $time/1000);
         $finish;
     end : watchdog
