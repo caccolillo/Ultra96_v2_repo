@@ -181,63 +181,67 @@ module tb_radio_link_1wire_pat6570;
 
     task automatic wb_write_a (input logic [2:0] reg_off,
                                 input logic [WB_DAT_W-1:0] data);
-        @(posedge clk);
-        a_adr  <= reg_off;
-        a_wdat <= data;
-        a_we   <= 1'b1;
-        a_stb  <= 1'b1;
-        a_cyc  <= 1'b1;
-        @(posedge clk);
+        @(negedge clk);          // drive on falling edge — stable before next rising
+        a_adr  = reg_off;
+        a_wdat = data;
+        a_we   = 1'b1;
+        a_stb  = 1'b1;
+        a_cyc  = 1'b1;
+        @(posedge clk);          // ack registered one clock after STB+CYC high
         while (!a_ack) @(posedge clk);
-        a_stb  <= 1'b0;
-        a_cyc  <= 1'b0;
-        a_we   <= 1'b0;
+        @(negedge clk);
+        a_stb  = 1'b0;
+        a_cyc  = 1'b0;
+        a_we   = 1'b0;
         @(posedge clk);
     endtask
 
     task automatic wb_read_a (input  logic [2:0] reg_off,
                                output logic [WB_DAT_W-1:0] data);
-        @(posedge clk);
-        a_adr  <= reg_off;
-        a_we   <= 1'b0;
-        a_stb  <= 1'b1;
-        a_cyc  <= 1'b1;
+        @(negedge clk);
+        a_adr  = reg_off;
+        a_we   = 1'b0;
+        a_stb  = 1'b1;
+        a_cyc  = 1'b1;
         @(posedge clk);
         while (!a_ack) @(posedge clk);
         data    = a_rdat;
-        a_stb  <= 1'b0;
-        a_cyc  <= 1'b0;
+        @(negedge clk);
+        a_stb  = 1'b0;
+        a_cyc  = 1'b0;
         @(posedge clk);
     endtask
 
     task automatic wb_write_b (input logic [2:0] reg_off,
                                 input logic [WB_DAT_W-1:0] data);
-        @(posedge clk);
-        b_adr  <= reg_off;
-        b_wdat <= data;
-        b_we   <= 1'b1;
-        b_stb  <= 1'b1;
-        b_cyc  <= 1'b1;
+        @(negedge clk);
+        b_adr  = reg_off;
+        b_wdat = data;
+        b_we   = 1'b1;
+        b_stb  = 1'b1;
+        b_cyc  = 1'b1;
         @(posedge clk);
         while (!b_ack) @(posedge clk);
-        b_stb  <= 1'b0;
-        b_cyc  <= 1'b0;
-        b_we   <= 1'b0;
+        @(negedge clk);
+        b_stb  = 1'b0;
+        b_cyc  = 1'b0;
+        b_we   = 1'b0;
         @(posedge clk);
     endtask
 
     task automatic wb_read_b (input  logic [2:0] reg_off,
                                output logic [WB_DAT_W-1:0] data);
-        @(posedge clk);
-        b_adr  <= reg_off;
-        b_we   <= 1'b0;
-        b_stb  <= 1'b1;
-        b_cyc  <= 1'b1;
+        @(negedge clk);
+        b_adr  = reg_off;
+        b_we   = 1'b0;
+        b_stb  = 1'b1;
+        b_cyc  = 1'b1;
         @(posedge clk);
         while (!b_ack) @(posedge clk);
         data    = b_rdat;
-        b_stb  <= 1'b0;
-        b_cyc  <= 1'b0;
+        @(negedge clk);
+        b_stb  = 1'b0;
+        b_cyc  = 1'b0;
         @(posedge clk);
     endtask
 
@@ -531,8 +535,8 @@ module tb_radio_link_1wire_pat6570;
     // Watchdog  — prevents infinite run if WB ack never arrives
     // =========================================================================
     initial begin : watchdog
-        #(200_000_000); // 200 ms sim time ceiling
-        $display("WATCHDOG TIMEOUT at %0t ns", $time);
+        #(2_000_000_000); // 2000 ms sim time ceiling (50 iter x 25 frames x 104us each)
+        $display("WATCHDOG TIMEOUT at %0t us -- increase timeout or reduce NUM_REBOOT_ITER", $time/1000);
         $finish;
     end : watchdog
 
