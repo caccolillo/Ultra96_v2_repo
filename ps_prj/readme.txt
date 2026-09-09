@@ -49,14 +49,13 @@ module tb_radio_link_1wire_pat6570;
     localparam int          WB_DAT_W             = 16;
     localparam int          WB_ADR_W             = 3;
     localparam logic [2:0]  WB_BASE              = 3'h0; // addr is reg offset only
-    localparam int          NUM_REBOOT_ITER       = 50;  // 50 x ~1.2ms = ~60ms sim time at divisor=5
+    localparam int          NUM_REBOOT_ITER       = 5;   // 5 x ~125ms = ~625ms sim time at real 9600 baud
 
     // Timing derived from RTL constants:
     //   BAUD_MULTIPLIER=16, DEFAULT_DIVISOR=520 => 9600 baud @ 80 MHz
     //   One byte = 10 bits = 160 baud-clocks = 160 * 520 * 12.5 ns = 1.04 ms
-    localparam real BYTE_PERIOD_NS  = 16.0 * 5.0   * CLK_PERIOD_NS; // ~1 us (divisor=5, 104x faster than real 9600 baud)
-    localparam int  SIM_DIVISOR         = 5;   // override — change to 520 for real-speed simulation
-    localparam real FRAME_PERIOD_NS = 3.0  * BYTE_PERIOD_NS;         // ~3 us at sim baud rate
+    localparam real BYTE_PERIOD_NS  = 16.0 * 520.0 * CLK_PERIOD_NS; // ~104 us real 9600 baud
+    localparam real FRAME_PERIOD_NS = 3.0  * BYTE_PERIOD_NS;         // ~312 us at 9600 baud
     localparam real SETTLE_NS       = 1200.0 * BYTE_PERIOD_NS;       // ~1.2 ms at sim baud rate (same 1200 byte periods, 104x faster)
 
     // Register offsets
@@ -126,7 +125,7 @@ module tb_radio_link_1wire_pat6570;
     // =========================================================================
 
     radio_link_1wire #(
-        .DEFAULT_DIVISOR (5),   // reduced from 520 for simulation speed (104x faster)
+        .DEFAULT_DIVISOR (520),
         .INVERT_RESET    (1'b0)
     ) dut_a (
         .RST_I       (rst_a),
@@ -143,7 +142,7 @@ module tb_radio_link_1wire_pat6570;
     );
 
     radio_link_1wire #(
-        .DEFAULT_DIVISOR (5),   // reduced from 520 for simulation speed (104x faster)
+        .DEFAULT_DIVISOR (520),
         .INVERT_RESET    (1'b0)
     ) dut_b (
         .RST_I       (rst_b),
@@ -286,8 +285,6 @@ module tb_radio_link_1wire_pat6570;
         @(negedge clk);
         rst_a = 1'b0; rst_b = 1'b0;
         repeat (4) @(posedge clk);   // let DUTs come out of reset cleanly
-        wb_write_a(REG_DIV, 16'd5); // restore fast divisor (reset clears to DEFAULT_DIVISOR=520)
-        wb_write_b(REG_DIV, 16'd5);
     endtask
 
     task automatic reset_a_only ();
@@ -297,7 +294,6 @@ module tb_radio_link_1wire_pat6570;
         @(negedge clk);
         rst_a = 1'b0;
         repeat (4) @(posedge clk);
-        wb_write_a(REG_DIV, 16'd5); // restore fast divisor after reset
     endtask
 
     task automatic reset_b_only ();
@@ -307,7 +303,6 @@ module tb_radio_link_1wire_pat6570;
         @(negedge clk);
         rst_b = 1'b0;
         repeat (4) @(posedge clk);
-        wb_write_b(REG_DIV, 16'd5); // restore fast divisor after reset
     endtask
 
     // =========================================================================
@@ -439,11 +434,6 @@ module tb_radio_link_1wire_pat6570;
         rst_a = 1'b0;
         rst_b = 1'b0;
         repeat (8) @(posedge clk);    // settle before first WB access
-        // Override baud divisor via Wishbone — generic override may not
-        // cross the mixed-language boundary correctly in ModelSim.
-        // Reset reloads DEFAULT_DIVISOR=520; writing 5 here gives 104x speedup.
-        wb_write_a(REG_DIV, 16'd5);
-        wb_write_b(REG_DIV, 16'd5);
 
         $display("=============================================================");
         $display("TB  PAT6-570  1-Wire Link Negotiation Failure Reproduction");
