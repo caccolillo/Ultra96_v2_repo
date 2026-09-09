@@ -159,6 +159,15 @@ module tb_radio_link_1wire_pat6570;
     );
 
     // =========================================================================
+    // Loop variables — must be module-level for ModelSim compatibility
+    // (ModelSim does not support variable declarations inside named
+    //  initial blocks or named begin/end blocks)
+    // =========================================================================
+
+    int          iter;
+    logic        reboot_a;
+
+    // =========================================================================
     // Scoreboard counters  (module-level so all tasks can access)
     // =========================================================================
 
@@ -172,6 +181,7 @@ module tb_radio_link_1wire_pat6570;
     // to avoid xsim restrictions on declarations inside begin/end blocks
     logic [WB_DAT_W-1:0] chk_prs_a, chk_prb_a, chk_rs_a, chk_rb_a;
     logic [WB_DAT_W-1:0] chk_prs_b, chk_prb_b, chk_rs_b, chk_rb_b;
+    logic                 fail_here;
     logic [WB_DAT_W-1:0] t4_prs_a, t4_rb_a;
     logic [WB_DAT_W-1:0] t5_prs_a;
 
@@ -301,8 +311,7 @@ module tb_radio_link_1wire_pat6570;
     // inside begin/end blocks)
     // =========================================================================
 
-    task automatic check_invariants (input string ctx, input int iter);
-        logic fail_here;
+    task automatic check_invariants (input string ctx, input int chk_iter);
 
         wb_read_a(REG_PRS, chk_prs_a);
         wb_read_a(REG_PRB, chk_prb_a);
@@ -318,7 +327,7 @@ module tb_radio_link_1wire_pat6570;
         fail_here = 1'b0;
 
         $display("[%0t ns] CHECK  ctx=%-25s iter=%0d",
-                 $time/1000, ctx, iter);
+                 $time/1000, ctx, chk_iter);
         $display("  A: PRS=%02Xh PRB=%02Xh RS=%02Xh RB=%02Xh",
                  chk_prs_a[7:0], chk_prb_a[7:0],
                  chk_rs_a[7:0],  chk_rb_a[7:0]);
@@ -396,9 +405,6 @@ module tb_radio_link_1wire_pat6570;
     // =========================================================================
 
     initial begin : test_main
-
-        int iter;
-        logic reboot_a;
 
         // Deassert all WB signals
         a_stb = 1'b0; a_cyc = 1'b0; a_we = 1'b0;
