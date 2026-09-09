@@ -1,148 +1,593 @@
-# PAT6-570 — FPGA Simulation Testbench: Dual-DUT Reproduction
+// =============================================================================
+// @file  tb_radio_link_1wire_pat6570.sv
+// @brief Dual-DUT SystemVerilog testbench for radio_link_1wire.
+//        Reproduces PAT6-570: 1-wire LINK negotiation failure where both
+//        radios become Active after single-side power cycle.
+//
+// @copyright Copyright (c) 2026: Park Air Systems Ltd. All Rights Reserved.
+//
+// Compatible with: Vivado 2023.1 xsim (mixed VHDL + SV)
+//
+// Topology
+// --------
+//   DUT_A (radio_link_1wire) <--open-drain wire model--> DUT_B (radio_link_1wire)
+//
+//   Open-drain bus: wired-AND of both TX outputs (active-low).
+//   Any DUT pulling low dominates. Each DUT's RX_I sees the shared bus.
+//
+// Wishbone address: WB_ADR_I is 3 bits = register offset only (block selected externally)
+//
+// Register offsets
+//   0 = REG_ID                  (read: ID_REV)
+//   1 = REG_DIVISOR             (R/W: baud divisor)
+//   2 = REG_PAIRED_RADIO_STATE  (read: FPGA-written from 1-wire RX)
+//   3 = REG_PAIRED_BIT_STATE    (read: FPGA-written from 1-wire RX)
+//   4 = REG_RADIO_STATE         (R/W: ARM-written local state)
+//   5 = REG_BIT_STATE           (R/W: ARM-written local bit state)
+//
+// State values (from Jira PAT6-570)
+//   Radio State: 0x00=no link  0xAA=new link  0x41=active  0x69=inactive
+//   Bit State:   0x00=no link  0x46=full svc  0x52=reduced  0x6E=no svc
+//
+// AC-TB-3 invariants checked after every reboot:
+//   [1] A.0x502 == B.0x504
+//   [2] A.0x503 == B.0x505
+//   [3] B.0x502 == A.0x504
+//   [4] B.0x503 == A.0x505
+//   [5] A.0x502 != A.0x505  (self-echo check, when states differ)
+// =============================================================================
 
-## What was built
+`timescale 1ns/1ps
 
-A SystemVerilog testbench (`tb_radio_link_1wire_pat6570.sv`) was written from
-scratch to reproduce the 1-wire link negotiation failure in simulation. The
-testbench instantiates two `radio_link_1wire` DUTs connected across a shared
-open-drain bus model, exactly replicating the real hardware topology:
+module tb_radio_link_1wire_pat6570;
 
-```
-DUT_A  <──  wired-AND open-drain bus  ──>  DUT_B
+    // =========================================================================
+    // Parameters
+    // =========================================================================
 
-bus = N_LINK_TX_O_A AND N_LINK_TX_O_B
-```
+    localparam real         CLK_PERIOD_NS        = 12.5;   // 80 MHz
+    localparam int          WB_DAT_W             = 16;
+    localparam int          WB_ADR_W             = 3;
+    localparam logic [2:0]  WB_BASE              = 3'h0; // addr is reg offset only
+    localparam int          NUM_REBOOT_ITER       = 50;
 
-Each DUT's `N_LINK_RX_I` is connected to the shared bus, which means any byte
-a DUT transmits also loops back into its own receive input — the mechanism that
-enables the self-echo failure described in the RTL findings.
+    // Timing derived from RTL constants:
+    //   BAUD_MULTIPLIER=16, DEFAULT_DIVISOR=520 => 9600 baud @ 80 MHz
+    //   One byte = 10 bits = 160 baud-clocks = 160 * 520 * 12.5 ns = 1.04 ms
+    localparam real BYTE_PERIOD_NS  = 16.0 * 520.0 * CLK_PERIOD_NS; // ~104 us
+    localparam real FRAME_PERIOD_NS = 3.0  * BYTE_PERIOD_NS;         // 2 bytes + margin
+    localparam real SETTLE_NS       = 10.0 * BYTE_PERIOD_NS;         // ~1.04 ms
 
-A Wishbone master in the testbench drives both DUTs independently, writing
-ARM-side state registers (`0x504`, `0x505`) and reading back FPGA-side paired
-registers (`0x502`, `0x503`), exactly as the ARM processor and MCP do in the
-real system.
+    // Register offsets
+    localparam logic [2:0] REG_ID     = 3'd0;
+    localparam logic [2:0] REG_DIV    = 3'd1;
+    localparam logic [2:0] REG_PRS    = 3'd2; // PAIRED_RADIO_STATE  0x502
+    localparam logic [2:0] REG_PRB    = 3'd3; // PAIRED_BIT_STATE    0x503
+    localparam logic [2:0] REG_RS     = 3'd4; // RADIO_STATE         0x504
+    localparam logic [2:0] REG_RB     = 3'd5; // BIT_STATE           0x505
 
----
+    // Known state values
+    localparam logic [7:0] ST_NO_LINK  = 8'h00;
+    localparam logic [7:0] ST_NEW_LINK = 8'hAA;
+    localparam logic [7:0] ST_ACTIVE   = 8'h41;
+    localparam logic [7:0] ST_INACTIVE = 8'h69;
+    localparam logic [7:0] BT_NO_LINK  = 8'h00;
+    localparam logic [7:0] BT_FULL_SVC = 8'h46;
+    localparam logic [7:0] BT_REDUCED  = 8'h52;
+    localparam logic [7:0] BT_NO_SVC   = 8'h6E;
 
-## Test structure
+    // Test 5 sentinel value (matches John Stevens' Python test: TEST_VALUE=123)
+    localparam logic [7:0] SELF_RX_TEST_VAL = 8'd123;
 
-The testbench runs five tests in sequence.
+    // =========================================================================
+    // Clock and resets
+    // =========================================================================
 
-| Test | Name | Description |
-|------|------|-------------|
-| 1 | Clean dual power-on | Both DUTs reset together, link negotiates, invariants checked |
-| 2 | Single-side reboot stress (50 iterations) | Alternates which DUT reboots while the peer remains mid-cycle — the primary PAT6-570 failure scenario |
-| 3 | Simultaneous reboot (5 repetitions) | Both DUTs reset together, should always recover correctly |
-| 4 | Self-echo detection | Checks `A.0x502 != A.0x505` directly after transmission |
-| 5 | `check_fpga_self_rx` equivalent | Port of John Stevens' field test script: writes 123 to `A.0x505`, asserts `A.0x502` does not follow it |
+    logic clk   = 1'b0;
+    always #(CLK_PERIOD_NS / 2.0) clk = ~clk;
 
-The following AC-TB-3 invariants are evaluated after every reboot iteration:
+    logic rst_a = 1'b0;  // start deasserted; reset_both() asserts when needed
+    logic rst_b = 1'b0;
 
-```
-[1]  A.0x502 == B.0x504    (A's paired state        == B's radio state)
-[2]  A.0x503 == B.0x505    (A's paired bit state     == B's bit state)
-[3]  B.0x502 == A.0x504    (B's paired state         == A's radio state)
-[4]  B.0x503 == A.0x505    (B's paired bit state     == A's bit state)
-[5]  A.0x502 != A.0x505    (self-echo check — when A's own states differ)
-```
+    // =========================================================================
+    // Open-drain bus
+    // =========================================================================
 
----
+    logic n_tx_a, n_tx_b;
+    wire  bus_w = n_tx_a & n_tx_b;   // wired-AND = open-drain
 
-## Simulation environment
+    // =========================================================================
+    // Wishbone — DUT_A
+    // =========================================================================
 
-| Parameter | Value |
-|-----------|-------|
-| Simulator | ModelSim DE 2022.3 |
-| DUT source | Real production RTL — no stubs or behavioural replacements |
-| Files under test | `radio_link_1wire.vhd`, `uart_tx6`, `uart_rx6`, `down_counter`, `sdr_input_pin_meta`, `sdr_output_pin` |
-| System clock | 80 MHz |
-| Baud rate | 9600 |
-| `DEFAULT_DIVISOR` | 520 |
-| One UART byte period | 104 µs simulation time |
-| Full run sim time | ~48.8 ms |
+    logic [WB_ADR_W-1:0] a_adr  = '0;
+    logic [WB_DAT_W-1:0] a_wdat = '0;
+    logic [WB_DAT_W-1:0] a_rdat;
+    logic                 a_stb  = 1'b0;
+    logic                 a_cyc  = 1'b0;
+    logic                 a_we   = 1'b0;
+    logic                 a_ack;
 
----
+    // =========================================================================
+    // Wishbone — DUT_B
+    // =========================================================================
 
-## Result
+    logic [WB_ADR_W-1:0] b_adr  = '0;
+    logic [WB_DAT_W-1:0] b_wdat = '0;
+    logic [WB_DAT_W-1:0] b_rdat;
+    logic                 b_stb  = 1'b0;
+    logic                 b_cyc  = 1'b0;
+    logic                 b_we   = 1'b0;
+    logic                 b_ack;
 
-```
-SUMMARY
-  Total checks  : 13
-  Pass          : 2
-  Fail          : 44
-  Self-echo     : 0
-  Byte-swap     : 0
-  RESULT: FAIL  PAT6-570 reproduced (44 violations)
-          Fix required: AC-RTL-1..4 (see Jira PAT6-570)
-```
+    // =========================================================================
+    // DUT instantiations  (VHDL entities, bound by xelab mixed-language)
+    // =========================================================================
 
-**PAT6-570 is confirmed reproducible in simulation.**
+    radio_link_1wire #(
+        .DEFAULT_DIVISOR (520),
+        .INVERT_RESET    (1'b0)
+    ) dut_a (
+        .RST_I       (rst_a),
+        .CLK_I       (clk),
+        .WB_ADR_I    (a_adr),
+        .WB_DAT_I    (a_wdat),
+        .WB_DAT_O    (a_rdat),
+        .WB_STB_I    (a_stb),
+        .WB_CYC_I    (a_cyc),
+        .WB_WE_I     (a_we),
+        .WB_ACK_O    (a_ack),
+        .N_LINK_TX_O (n_tx_a),
+        .N_LINK_RX_I (bus_w)
+    );
 
-44 invariant evaluations fail across 13 check points; only 2 pass. All failures
-are cross-radio mapping violations — after a single-side reboot, `A.0x502` does
-not correctly reflect `B.0x504` and vice versa. The paired registers either
-retain stale data from the previous link cycle or fail to update within the
-re-negotiation window following reboot.
+    radio_link_1wire #(
+        .DEFAULT_DIVISOR (520),
+        .INVERT_RESET    (1'b0)
+    ) dut_b (
+        .RST_I       (rst_b),
+        .CLK_I       (clk),
+        .WB_ADR_I    (b_adr),
+        .WB_DAT_I    (b_wdat),
+        .WB_DAT_O    (b_rdat),
+        .WB_STB_I    (b_stb),
+        .WB_CYC_I    (b_cyc),
+        .WB_WE_I     (b_we),
+        .WB_ACK_O    (b_ack),
+        .N_LINK_TX_O (n_tx_b),
+        .N_LINK_RX_I (bus_w)
+    );
 
-The self-echo and byte-swap counters read zero in this run. These specific
-failure modes (0x502 tracking 0x505, or state and bit bytes transposed) are
-timing-sensitive races that require adversarial reboot timing relative to the
-peer's transmit cycle to manifest. They are captured by the field test scripts
-but require a longer stress run or deliberately-timed reboot injection in
-simulation to trigger consistently.
+    // =========================================================================
+    // Loop variables — must be module-level for ModelSim compatibility
+    // (ModelSim does not support variable declarations inside named
+    //  initial blocks or named begin/end blocks)
+    // =========================================================================
 
----
+    int          iter;
+    logic        reboot_a;
 
-## What this confirms
+    // =========================================================================
+    // Scoreboard counters  (module-level so all tasks can access)
+    // =========================================================================
 
-The simulation result is consistent with all four RTL findings previously
-documented in this ticket.
+    int unsigned total_checks    = 0;
+    int unsigned pass_count      = 0;
+    int unsigned fail_count      = 0;
+    int unsigned self_echo_hits  = 0;
+    int unsigned byte_swap_hits  = 0;
 
-### No RX frame validation
-`ValidateReceivedBytes` commits `RxDataArray(0)` → `PairedRadioState` and
-`RxDataArray(1)` → `PairedRadioBitState` without checking the source, length,
-or structure of the received frame. After a single-side reboot, stale or
-corrupted data is committed silently.
+    // Scratchpad registers for check task — declared at module level
+    // to avoid xsim restrictions on declarations inside begin/end blocks
+    logic [WB_DAT_W-1:0] chk_prs_a, chk_prb_a, chk_rs_a, chk_rb_a;
+    logic [WB_DAT_W-1:0] chk_prs_b, chk_prb_b, chk_rs_b, chk_rb_b;
+    logic                 fail_here;
+    logic [WB_DAT_W-1:0] t4_prs_a, t4_rb_a;
+    logic [WB_DAT_W-1:0] t5_prs_a;
 
-### No self-echo rejection
-The open-drain bus feeds the local transmit signal back into the local receive
-input (`LinkConflict <= link_rx xor LinkTxDrive`). There is no guard in
-`ValidateReceivedBytes` to reject a frame that matches the locally transmitted
-data. This enables the self-receive failure mode observed in field testing.
+    // =========================================================================
+    // Wishbone helper tasks
+    // =========================================================================
 
-### No frame framing or sync bytes
-The protocol transmits a bare 2-byte payload with no start-of-frame delimiter,
-sequence number, or checksum. A receive window that opens mid-frame after a
-reboot silently commits misaligned bytes — the byte-swap failure mode where
-`0x502` contains a bit-state value and `0x503` contains a radio-state value.
+    task automatic wb_write_a (input logic [2:0] reg_off,
+                                input logic [WB_DAT_W-1:0] data);
+        // Wait until DUT_A is out of reset
+        while (rst_a) @(posedge clk);
+        @(negedge clk);
+        a_adr  = reg_off;
+        a_wdat = data;
+        a_we   = 1'b1;
+        a_stb  = 1'b1;
+        a_cyc  = 1'b1;
+        @(posedge clk);
+        while (!a_ack) @(posedge clk);
+        @(negedge clk);
+        a_stb  = 1'b0;
+        a_cyc  = 1'b0;
+        a_we   = 1'b0;
+        @(posedge clk);
+    endtask
 
-### Stale buffer retention
-`RxDataArray` is only cleared on a full `RST_I` assertion. A timeout or
-collision that resets `RxCount` via `ResetRxCount` without asserting `RST_I`
-leaves `RxDataArray` holding fragments from the previous link cycle, which
-contaminate the next `ValidateReceivedBytes` commit.
+    task automatic wb_read_a (input  logic [2:0] reg_off,
+                               output logic [WB_DAT_W-1:0] data);
+        while (rst_a) @(posedge clk);
+        @(negedge clk);
+        a_adr  = reg_off;
+        a_we   = 1'b0;
+        a_stb  = 1'b1;
+        a_cyc  = 1'b1;
+        @(posedge clk);
+        while (!a_ack) @(posedge clk);
+        data    = a_rdat;
+        @(negedge clk);
+        a_stb  = 1'b0;
+        a_cyc  = 1'b0;
+        @(posedge clk);
+    endtask
 
----
+    task automatic wb_write_b (input logic [2:0] reg_off,
+                                input logic [WB_DAT_W-1:0] data);
+        while (rst_b) @(posedge clk);
+        @(negedge clk);
+        b_adr  = reg_off;
+        b_wdat = data;
+        b_we   = 1'b1;
+        b_stb  = 1'b1;
+        b_cyc  = 1'b1;
+        @(posedge clk);
+        while (!b_ack) @(posedge clk);
+        @(negedge clk);
+        b_stb  = 1'b0;
+        b_cyc  = 1'b0;
+        b_we   = 1'b0;
+        @(posedge clk);
+    endtask
 
-## Next steps
+    task automatic wb_read_b (input  logic [2:0] reg_off,
+                               output logic [WB_DAT_W-1:0] data);
+        while (rst_b) @(posedge clk);
+        @(negedge clk);
+        b_adr  = reg_off;
+        b_we   = 1'b0;
+        b_stb  = 1'b1;
+        b_cyc  = 1'b1;
+        @(posedge clk);
+        while (!b_ack) @(posedge clk);
+        data    = b_rdat;
+        @(negedge clk);
+        b_stb  = 1'b0;
+        b_cyc  = 1'b0;
+        @(posedge clk);
+    endtask
 
-The testbench is ready to serve as the regression gate for the RTL fix. The
-acceptance criteria for closure are:
+    // =========================================================================
+    // State-writing helpers
+    // =========================================================================
 
-- All 13 checks pass with zero failures across the full 50-iteration reboot
-  stress run
-- `NUM_REBOOT_ITER` increased to ≥ 1000 for the final regression
-- Deliberately-timed reboot injection added to consistently trigger the
-  self-echo and byte-swap cases (self-echo hits and byte-swap hits both > 0
-  before the fix, both = 0 after)
+    task automatic set_states_a (input logic [7:0] st, input logic [7:0] bt);
+        wb_write_a(REG_RS, {{(WB_DAT_W-8){1'b0}}, st});
+        wb_write_a(REG_RB, {{(WB_DAT_W-8){1'b0}}, bt});
+    endtask
 
-Once AC-RTL-1 through AC-RTL-4 are implemented:
+    task automatic set_states_b (input logic [7:0] st, input logic [7:0] bt);
+        wb_write_b(REG_RS, {{(WB_DAT_W-8){1'b0}}, st});
+        wb_write_b(REG_RB, {{(WB_DAT_W-8){1'b0}}, bt});
+    endtask
 
-| Criterion | Required fix |
-|-----------|-------------|
-| AC-RTL-1 | Self-echo rejection in `ValidateReceivedBytes` |
-| AC-RTL-2 | Packet framing: sync byte + checksum in transmitted frame |
-| AC-RTL-3 | Buffer hygiene: clear `RxDataArray` on timeout and collision reset |
-| AC-RTL-4 | Validation gate: full frame check before committing paired registers |
+    // =========================================================================
+    // Reset helpers
+    // =========================================================================
 
-The testbench file `tb_radio_link_1wire_pat6570.sv` is attached to this ticket.
+    task automatic reset_both ();
+        @(negedge clk);
+        rst_a = 1'b1; rst_b = 1'b1;
+        repeat (16) @(posedge clk);  // hold reset for 16 cycles
+        @(negedge clk);
+        rst_a = 1'b0; rst_b = 1'b0;
+        repeat (4) @(posedge clk);   // let DUTs come out of reset cleanly
+    endtask
+
+    task automatic reset_a_only ();
+        @(negedge clk);
+        rst_a = 1'b1;
+        repeat (16) @(posedge clk);
+        @(negedge clk);
+        rst_a = 1'b0;
+        repeat (4) @(posedge clk);
+    endtask
+
+    task automatic reset_b_only ();
+        @(negedge clk);
+        rst_b = 1'b1;
+        repeat (16) @(posedge clk);
+        @(negedge clk);
+        rst_b = 1'b0;
+        repeat (4) @(posedge clk);
+    endtask
+
+    // =========================================================================
+    // Scoreboard check task
+    // Uses module-level scratchpad signals (xsim-safe — no declarations
+    // inside begin/end blocks)
+    // =========================================================================
+
+    task automatic check_invariants (input string ctx, input int chk_iter);
+
+        wb_read_a(REG_PRS, chk_prs_a);
+        wb_read_a(REG_PRB, chk_prb_a);
+        wb_read_a(REG_RS,  chk_rs_a);
+        wb_read_a(REG_RB,  chk_rb_a);
+
+        wb_read_b(REG_PRS, chk_prs_b);
+        wb_read_b(REG_PRB, chk_prb_b);
+        wb_read_b(REG_RS,  chk_rs_b);
+        wb_read_b(REG_RB,  chk_rb_b);
+
+        total_checks++;
+        fail_here = 1'b0;
+
+        $display("[%0t ns] CHECK  ctx=%-25s iter=%0d",
+                 $time/1000, ctx, chk_iter);
+        $display("  A: PRS=%02Xh PRB=%02Xh RS=%02Xh RB=%02Xh",
+                 chk_prs_a[7:0], chk_prb_a[7:0],
+                 chk_rs_a[7:0],  chk_rb_a[7:0]);
+        $display("  B: PRS=%02Xh PRB=%02Xh RS=%02Xh RB=%02Xh",
+                 chk_prs_b[7:0], chk_prb_b[7:0],
+                 chk_rs_b[7:0],  chk_rb_b[7:0]);
+
+        // Skip check if link not yet established on either side
+        if (chk_rs_a[7:0] == ST_NO_LINK || chk_rs_b[7:0] == ST_NO_LINK) begin
+            $display("  SKIP  (link not established)");
+        end else begin
+
+            // [1] A.PRS == B.RS
+            if (chk_prs_a[7:0] !== chk_rs_b[7:0]) begin
+                $display("  FAIL[1] A.PRS(502)=%02Xh != B.RS(504)=%02Xh",
+                         chk_prs_a[7:0], chk_rs_b[7:0]);
+                fail_here = 1'b1;
+                fail_count++;
+            end
+
+            // [2] A.PRB == B.RB
+            if (chk_prb_a[7:0] !== chk_rb_b[7:0]) begin
+                $display("  FAIL[2] A.PRB(503)=%02Xh != B.RB(505)=%02Xh",
+                         chk_prb_a[7:0], chk_rb_b[7:0]);
+                fail_here = 1'b1;
+                fail_count++;
+            end
+
+            // [3] B.PRS == A.RS
+            if (chk_prs_b[7:0] !== chk_rs_a[7:0]) begin
+                $display("  FAIL[3] B.PRS(502)=%02Xh != A.RS(504)=%02Xh",
+                         chk_prs_b[7:0], chk_rs_a[7:0]);
+                fail_here = 1'b1;
+                fail_count++;
+            end
+
+            // [4] B.PRB == A.RB
+            if (chk_prb_b[7:0] !== chk_rb_a[7:0]) begin
+                $display("  FAIL[4] B.PRB(503)=%02Xh != A.RB(505)=%02Xh",
+                         chk_prb_b[7:0], chk_rb_a[7:0]);
+                fail_here = 1'b1;
+                fail_count++;
+            end
+
+            // [5] Self-echo: A.PRS != A.RB  (when A's own RS != RB)
+            // Only check when both values are non-zero — 0x00 is the
+            // legitimate no-link state and is not a self-echo condition
+            if ((chk_rs_a[7:0] !== chk_rb_a[7:0]) &&
+                (chk_prs_a[7:0] !== 8'h00) &&
+                (chk_rb_a[7:0]  !== 8'h00)) begin
+                if (chk_prs_a[7:0] === chk_rb_a[7:0]) begin
+                    $display("  FAIL[5-SELF-ECHO] A.PRS(502)=%02Xh == A.RB(505)=%02Xh",
+                             chk_prs_a[7:0], chk_rb_a[7:0]);
+                    self_echo_hits++;
+                    fail_here = 1'b1;
+                    fail_count++;
+                end
+            end
+
+            // [6] Byte-swap: A.PRS == B.RB and A.PRS != B.RS
+            if ((chk_prs_a[7:0] === chk_rb_b[7:0]) &&
+                (chk_prs_a[7:0] !== chk_rs_b[7:0])) begin
+                $display("  FAIL[6-BYTESWAP] A.PRS(502)=%02Xh == B.RB(505)=%02Xh (B.RS=%02Xh)",
+                         chk_prs_a[7:0], chk_rb_b[7:0], chk_rs_b[7:0]);
+                byte_swap_hits++;
+                fail_here = 1'b1;
+            end
+
+            if (!fail_here) begin
+                pass_count++;
+                $display("  PASS");
+            end
+
+        end
+    endtask
+
+    // =========================================================================
+    // Main test sequence
+    // =========================================================================
+
+    initial begin : test_main
+
+        // Deassert all WB signals
+        a_stb = 1'b0; a_cyc = 1'b0; a_we = 1'b0;
+        b_stb = 1'b0; b_cyc = 1'b0; b_we = 1'b0;
+
+        // Assert reset immediately at time 0 so divisor_reg and all
+        // internal registers get initialised to their DEFAULT values.
+        // Without this, divisor_reg stays 0 => Uart16xBaudEn stuck high.
+        rst_a = 1'b1;
+        rst_b = 1'b1;
+        repeat (32) @(posedge clk);   // hold reset for 32 cycles
+        @(negedge clk);
+        rst_a = 1'b0;
+        rst_b = 1'b0;
+        repeat (8) @(posedge clk);    // settle before first WB access
+
+        $display("=============================================================");
+        $display("TB  PAT6-570  1-Wire Link Negotiation Failure Reproduction");
+        $display("    Tool  : Vivado 2023.1 xsim");
+        $display("    Clock : 80 MHz   Baud : 9600   DIVISOR : 520");
+        $display("    Byte period : %0.0f ns   Settle : %0.0f ns",
+                 BYTE_PERIOD_NS, SETTLE_NS);
+        $display("=============================================================");
+
+        // ------------------------------------------------------------------
+        // TEST 1  Clean dual power-on
+        //         Both DUTs reset together — link should negotiate correctly
+        // ------------------------------------------------------------------
+        $display("\n=== TEST 1: Clean dual power-on ===");
+        reset_both();
+        set_states_a(ST_ACTIVE,   BT_FULL_SVC);
+        set_states_b(ST_INACTIVE, BT_FULL_SVC);
+        #(SETTLE_NS);
+        check_invariants("clean-dual-powerup", 0);
+
+        // ------------------------------------------------------------------
+        // TEST 2  Single-side reboot stress (AC-TB-2: >= 10000 in full run;
+        //         NUM_REBOOT_ITER=50 here for rapid reproduction)
+        //         DUT_A or DUT_B reboots while the peer is mid-cycle.
+        //         With the buggy RTL this reproduces PAT6-570 within ~10 iter.
+        // ------------------------------------------------------------------
+        $display("\n=== TEST 2: Single-side reboot x%0d ===", NUM_REBOOT_ITER);
+
+        for (iter = 0; iter < NUM_REBOOT_ITER; iter++) begin
+
+            reboot_a = (iter % 2 == 0);
+
+            if (reboot_a) begin
+                $display("\n  [%0d] Rebooting A only (B running mid-cycle)", iter);
+                reset_a_only();
+                set_states_a(ST_ACTIVE,   BT_FULL_SVC);
+            end else begin
+                $display("\n  [%0d] Rebooting B only (A running mid-cycle)", iter);
+                reset_b_only();
+                set_states_b(ST_INACTIVE, BT_FULL_SVC);
+            end
+
+            // Wait for re-negotiation attempt
+            #(FRAME_PERIOD_NS * 20.0);
+            check_invariants("single-side-reboot", iter);
+
+            // Short gap between iterations
+            #(FRAME_PERIOD_NS * 5.0);
+        end
+
+        // ------------------------------------------------------------------
+        // TEST 3  Simultaneous reboot — should always recover
+        // ------------------------------------------------------------------
+        $display("\n=== TEST 3: Simultaneous reboot x5 ===");
+        repeat (5) begin
+            reset_both();
+            set_states_a(ST_ACTIVE,   BT_FULL_SVC);
+            set_states_b(ST_INACTIVE, BT_FULL_SVC);
+            #(SETTLE_NS);
+            check_invariants("simultaneous-reboot", 0);
+        end
+
+        // ------------------------------------------------------------------
+        // TEST 4  Self-echo: A.PRS(0x502) must not mirror A.RB(0x505)
+        //         AC-RTL-1 / AC-TB-3 criterion [5]
+        //         Uses module-level signals t4_prs_a, t4_rb_a
+        // ------------------------------------------------------------------
+        $display("\n=== TEST 4: Self-echo detection ===");
+        set_states_a(8'h41, 8'h46);   // Active / Full-service
+        set_states_b(8'h69, 8'h52);   // Inactive / Reduced
+        #(FRAME_PERIOD_NS * 3.0);
+
+        wb_read_a(REG_PRS, t4_prs_a);
+        wb_read_a(REG_RB,  t4_rb_a);
+
+        total_checks++;
+        $display("  A.PRS(502)=%02Xh  A.RB(505)=%02Xh", t4_prs_a[7:0], t4_rb_a[7:0]);
+        // Only flag self-echo when values are non-zero (0x00 = no-link, not self-echo)
+        if ((t4_prs_a[7:0] === t4_rb_a[7:0]) &&
+            (t4_prs_a[7:0] !== 8'h00) &&
+            (t4_rb_a[7:0]  !== 8'h00)) begin
+            $display("  FAIL[SELF-ECHO] A.PRS == A.RB  (self-receive confirmed)");
+            self_echo_hits++;
+            fail_count++;
+        end else begin
+            $display("  PASS  A.PRS != A.RB");
+            pass_count++;
+        end
+
+        // ------------------------------------------------------------------
+        // TEST 5  Jira check_fpga_self_rx equivalent
+        //         (John Stevens comment 18-Aug-2026)
+        //         Write SELF_RX_TEST_VAL=123 to A.0x505.
+        //         In broken state A.0x502 follows A.0x505.
+        //         Uses module-level signal t5_prs_a
+        // ------------------------------------------------------------------
+        $display("\n=== TEST 5: check_fpga_self_rx (TEST_VALUE=%0d) ===",
+                 SELF_RX_TEST_VAL);
+
+        reset_both();
+        set_states_a(ST_ACTIVE,   BT_FULL_SVC);
+        set_states_b(ST_INACTIVE, BT_FULL_SVC);
+        #(SETTLE_NS);
+
+        // Single-side reboot of A — this is the trigger
+        reset_a_only();
+        wb_write_a(REG_RB, {{(WB_DAT_W-8){1'b0}}, SELF_RX_TEST_VAL});
+        set_states_a(ST_ACTIVE, SELF_RX_TEST_VAL);
+
+        // Wait for A to transmit and potentially self-receive
+        #(FRAME_PERIOD_NS * 5.0);
+
+        wb_read_a(REG_PRS, t5_prs_a);
+
+        total_checks++;
+        $display("  Wrote A.BIT_STATE(505)=%0d  Read A.PRS(502)=%0d",
+                 SELF_RX_TEST_VAL, t5_prs_a[7:0]);
+        if (t5_prs_a[7:0] === SELF_RX_TEST_VAL) begin
+            $display("  FAIL[SELF-RX] A.PRS == TEST_VALUE => PAT6-570 reproduced");
+            self_echo_hits++;
+            fail_count++;
+        end else begin
+            $display("  PASS  A.PRS != TEST_VALUE");
+            pass_count++;
+        end
+
+        // ------------------------------------------------------------------
+        // Summary
+        // ------------------------------------------------------------------
+        $display("\n=============================================================");
+        $display("SUMMARY");
+        $display("  Total checks  : %0d", total_checks);
+        $display("  Pass          : %0d", pass_count);
+        $display("  Fail          : %0d", fail_count);
+        $display("  Self-echo     : %0d", self_echo_hits);
+        $display("  Byte-swap     : %0d", byte_swap_hits);
+
+        if (fail_count > 0) begin
+            $display("  RESULT: FAIL  PAT6-570 reproduced (%0d violations)",
+                     fail_count);
+            $display("          Fix required: AC-RTL-1..4 (see Jira PAT6-570)");
+        end else begin
+            $display("  RESULT: PASS  No negotiation failures detected");
+        end
+        $display("=============================================================");
+
+        $finish;
+    end : test_main
+
+    // =========================================================================
+    // Watchdog  — prevents infinite run if WB ack never arrives
+    // =========================================================================
+    initial begin : watchdog
+        #(2_000_000_000); // 2000 ms sim time ceiling (50 iter x 25 frames x 104us each)
+        $display("WATCHDOG TIMEOUT at %0t us -- increase timeout or reduce NUM_REBOOT_ITER", $time/1000);
+        $finish;
+    end : watchdog
+
+    // =========================================================================
+    // VCD waveform dump  (xsim converts to .wdb automatically with -wdb flag)
+    // =========================================================================
+    initial begin : wave_dump
+        $dumpfile("pat6570.vcd");
+        $dumpvars(0, tb_radio_link_1wire_pat6570);
+    end : wave_dump
+
+endmodule : tb_radio_link_1wire_pat6570
