@@ -194,17 +194,18 @@ module tb_radio_link_1wire_pat6570;
         a_we   = 1'b1;
         a_stb  = 1'b1;
         a_cyc  = 1'b1;
-        @(posedge clk);
-        while (!a_ack) @(posedge clk);
-        // Deassert immediately on the same negedge so the RTL sees exactly
-        // one CYC&STB cycle — prevents the next write's address bleeding in.
-        @(negedge clk);
+        // Hold CYC&STB&data valid until we have SEEN ack, then hold one more
+        // full clock so the RTL register-write edge captures valid data.
+        do @(posedge clk); while (!a_ack);
+        @(negedge clk);              // one negedge after ack seen
         a_stb  = 1'b0;
         a_cyc  = 1'b0;
         a_we   = 1'b0;
+        // data/adr held stable one more cycle, THEN cleared
+        @(posedge clk);
         a_adr  = 3'h0;
         a_wdat = 16'h0000;
-        repeat (2) @(posedge clk);   // bus idle before next transaction
+        repeat (2) @(posedge clk);
     endtask
 
     task automatic wb_read_a (input  logic [2:0] reg_off,
@@ -215,8 +216,7 @@ module tb_radio_link_1wire_pat6570;
         a_we   = 1'b0;
         a_stb  = 1'b1;
         a_cyc  = 1'b1;
-        @(posedge clk);
-        while (!a_ack) @(posedge clk);
+        do @(posedge clk); while (!a_ack);
         data    = a_rdat;
         @(negedge clk);
         a_stb  = 1'b0;
@@ -234,12 +234,12 @@ module tb_radio_link_1wire_pat6570;
         b_we   = 1'b1;
         b_stb  = 1'b1;
         b_cyc  = 1'b1;
-        @(posedge clk);
-        while (!b_ack) @(posedge clk);
+        do @(posedge clk); while (!b_ack);
         @(negedge clk);
         b_stb  = 1'b0;
         b_cyc  = 1'b0;
         b_we   = 1'b0;
+        @(posedge clk);
         b_adr  = 3'h0;
         b_wdat = 16'h0000;
         repeat (2) @(posedge clk);
@@ -253,8 +253,7 @@ module tb_radio_link_1wire_pat6570;
         b_we   = 1'b0;
         b_stb  = 1'b1;
         b_cyc  = 1'b1;
-        @(posedge clk);
-        while (!b_ack) @(posedge clk);
+        do @(posedge clk); while (!b_ack);
         data    = b_rdat;
         @(negedge clk);
         b_stb  = 1'b0;
