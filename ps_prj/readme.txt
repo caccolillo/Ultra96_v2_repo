@@ -188,21 +188,24 @@ module tb_radio_link_1wire_pat6570;
     task automatic wb_write_a (input logic [2:0] reg_off,
                                 input logic [WB_DAT_W-1:0] data);
         while (rst_a) @(posedge clk);
+        // Drive stimulus on negedge so it is rock-stable at every rising edge.
         @(negedge clk);
         a_adr  = reg_off;
         a_wdat = data;
         a_we   = 1'b1;
         a_stb  = 1'b1;
         a_cyc  = 1'b1;
-        // Hold CYC&STB&data valid until we have SEEN ack, then hold one more
-        // full clock so the RTL register-write edge captures valid data.
-        do @(posedge clk); while (!a_ack);
-        @(negedge clk);              // one negedge after ack seen
+        // RTL asserts WB_ACK_O on the rising edge it sees CYC&STB and samples
+        // WB_DAT_I on that SAME edge. Keep everything asserted and stable until
+        // ack is observed. Data must never change while CYC&STB are high.
+        do @(posedge clk); while (a_ack !== 1'b1);
+        // Ack seen. Data was valid on the sampling edge. Now release on negedge.
+        @(negedge clk);
         a_stb  = 1'b0;
         a_cyc  = 1'b0;
         a_we   = 1'b0;
-        // data/adr held stable one more cycle, THEN cleared
-        @(posedge clk);
+        // Keep adr/data stable one full cycle after deassert, then idle.
+        @(negedge clk);
         a_adr  = 3'h0;
         a_wdat = 16'h0000;
         repeat (2) @(posedge clk);
@@ -216,7 +219,9 @@ module tb_radio_link_1wire_pat6570;
         a_we   = 1'b0;
         a_stb  = 1'b1;
         a_cyc  = 1'b1;
-        do @(posedge clk); while (!a_ack);
+        // RTL drives WB_DAT_O on the ack edge; it is cleared next cycle, so
+        // sample a_rdat on the SAME edge ack is observed.
+        do @(posedge clk); while (a_ack !== 1'b1);
         data    = a_rdat;
         @(negedge clk);
         a_stb  = 1'b0;
@@ -234,12 +239,12 @@ module tb_radio_link_1wire_pat6570;
         b_we   = 1'b1;
         b_stb  = 1'b1;
         b_cyc  = 1'b1;
-        do @(posedge clk); while (!b_ack);
+        do @(posedge clk); while (b_ack !== 1'b1);
         @(negedge clk);
         b_stb  = 1'b0;
         b_cyc  = 1'b0;
         b_we   = 1'b0;
-        @(posedge clk);
+        @(negedge clk);
         b_adr  = 3'h0;
         b_wdat = 16'h0000;
         repeat (2) @(posedge clk);
@@ -253,7 +258,7 @@ module tb_radio_link_1wire_pat6570;
         b_we   = 1'b0;
         b_stb  = 1'b1;
         b_cyc  = 1'b1;
-        do @(posedge clk); while (!b_ack);
+        do @(posedge clk); while (b_ack !== 1'b1);
         data    = b_rdat;
         @(negedge clk);
         b_stb  = 1'b0;
