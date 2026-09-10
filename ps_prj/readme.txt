@@ -187,7 +187,6 @@ module tb_radio_link_1wire_pat6570;
 
     task automatic wb_write_a (input logic [2:0] reg_off,
                                 input logic [WB_DAT_W-1:0] data);
-        // Wait until DUT_A is out of reset
         while (rst_a) @(posedge clk);
         @(negedge clk);
         a_adr  = reg_off;
@@ -197,11 +196,15 @@ module tb_radio_link_1wire_pat6570;
         a_cyc  = 1'b1;
         @(posedge clk);
         while (!a_ack) @(posedge clk);
+        // Deassert immediately on the same negedge so the RTL sees exactly
+        // one CYC&STB cycle — prevents the next write's address bleeding in.
         @(negedge clk);
         a_stb  = 1'b0;
         a_cyc  = 1'b0;
         a_we   = 1'b0;
-        @(posedge clk);
+        a_adr  = 3'h0;
+        a_wdat = 16'h0000;
+        repeat (2) @(posedge clk);   // bus idle before next transaction
     endtask
 
     task automatic wb_read_a (input  logic [2:0] reg_off,
@@ -218,7 +221,8 @@ module tb_radio_link_1wire_pat6570;
         @(negedge clk);
         a_stb  = 1'b0;
         a_cyc  = 1'b0;
-        @(posedge clk);
+        a_adr  = 3'h0;
+        repeat (2) @(posedge clk);
     endtask
 
     task automatic wb_write_b (input logic [2:0] reg_off,
@@ -236,7 +240,9 @@ module tb_radio_link_1wire_pat6570;
         b_stb  = 1'b0;
         b_cyc  = 1'b0;
         b_we   = 1'b0;
-        @(posedge clk);
+        b_adr  = 3'h0;
+        b_wdat = 16'h0000;
+        repeat (2) @(posedge clk);
     endtask
 
     task automatic wb_read_b (input  logic [2:0] reg_off,
@@ -253,7 +259,8 @@ module tb_radio_link_1wire_pat6570;
         @(negedge clk);
         b_stb  = 1'b0;
         b_cyc  = 1'b0;
-        @(posedge clk);
+        b_adr  = 3'h0;
+        repeat (2) @(posedge clk);
     endtask
 
     // =========================================================================
@@ -261,13 +268,32 @@ module tb_radio_link_1wire_pat6570;
     // =========================================================================
 
     task automatic set_states_a (input logic [7:0] st, input logic [7:0] bt);
+        logic [WB_DAT_W-1:0] rb;
         wb_write_a(REG_RS, {{(WB_DAT_W-8){1'b0}}, st});
         wb_write_a(REG_RB, {{(WB_DAT_W-8){1'b0}}, bt});
+        // Readback verification — confirm the writes actually landed
+        wb_read_a(REG_RS, rb);
+        if (rb[7:0] !== st)
+            $display("  WARN set_states_a: RS readback %02Xh != written %02Xh",
+                     rb[7:0], st);
+        wb_read_a(REG_RB, rb);
+        if (rb[7:0] !== bt)
+            $display("  WARN set_states_a: RB readback %02Xh != written %02Xh",
+                     rb[7:0], bt);
     endtask
 
     task automatic set_states_b (input logic [7:0] st, input logic [7:0] bt);
+        logic [WB_DAT_W-1:0] rb;
         wb_write_b(REG_RS, {{(WB_DAT_W-8){1'b0}}, st});
         wb_write_b(REG_RB, {{(WB_DAT_W-8){1'b0}}, bt});
+        wb_read_b(REG_RS, rb);
+        if (rb[7:0] !== st)
+            $display("  WARN set_states_b: RS readback %02Xh != written %02Xh",
+                     rb[7:0], st);
+        wb_read_b(REG_RB, rb);
+        if (rb[7:0] !== bt)
+            $display("  WARN set_states_b: RB readback %02Xh != written %02Xh",
+                     rb[7:0], bt);
     endtask
 
     // =========================================================================
