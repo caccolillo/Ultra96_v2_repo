@@ -10,8 +10,8 @@
 // --------
 //   DUT_A (radio_link_1wire) <--open-drain wire model--> DUT_B (radio_link_1wire)
 //
-//   Open-drain bus: wired-AND of both TX outputs (active-low).
-//   Any DUT pulling low dominates. Each DUT's RX_I sees the shared bus.
+//   Open-drain bus: N_LINK_TX_O/RX_I are inverted. Bus = wired-OR of
+//   inverted TX outputs. Any DUT asserting (driving 1) dominates.
 //
 // Wishbone address:
 //   WB_ADR_I is 3 bits = register offset only (block selected externally)
@@ -110,7 +110,12 @@ module tb_radio_link_1wire_pat6570;
     // =========================================================================
 
     logic n_tx_a, n_tx_b;
-    wire  bus_w = n_tx_a & n_tx_b;
+    // Open-drain bus: N_LINK_TX_O and N_LINK_RX_I are INVERTED signals.
+    //   0 = DUT releasing bus (idle)   1 = DUT asserting (pulling bus low)
+    // In the inverted domain any DUT asserting pulls the bus low:
+    //   bus = n_tx_a OR n_tx_b  (wired-OR of inverted outputs)
+    // Equivalent to wired-AND in the non-inverted domain.
+    wire  bus_w = n_tx_a | n_tx_b;
 
     // =========================================================================
     // Wishbone @ DUT_A
