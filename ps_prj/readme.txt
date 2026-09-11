@@ -37,21 +37,21 @@
 //   [6] A.PRS != B.RB and A.PRS == B.RS  (byte-swap check)
 //
 // New tests added from Scott Hisee email 11-Sep-2026 and hardware log analysis:
-//   TEST 6 — Manual toggle regression: after negotiation, manually toggling
-//            the Inactive radio to Active should trigger changeover on peer
-//   TEST 7 — Link-down changeover: Active radio loses link, Inactive peer
-//            should go Active within RECEIVE_TIMEOUT
-//   TEST 8 — Reboot race: matches the 3s/6s hardware failure window from
-//            messages_237006.txt / messages_216882.txt logs
+//   TEST 6 — Manual toggle regression
+//   TEST 7 — Link-down changeover
+//   TEST 8 — Reboot race (T+3s/T+6s window from hardware logs)
 //
-// Wishbone write protocol note:
-//   The RTL (wb_registers process) samples WB_DAT_I on the rising edge that
-//   also asserts WB_ACK_O. adr and wdat MUST be cleared atomically with
-//   stb/cyc/we at the negedge after ACK to prevent a rogue zero-write to
-//   whatever address is on the bus during signal transitions.
+// Wishbone timing notes:
+//   - adr/wdat driven one full cycle before STB assertion
+//   - adr/wdat/stb/cyc/we cleared atomically at negedge after ACK
+//     (prevents rogue write during signal transitions)
+//   - wb_write tasks guard on rst=0 PLUS wait one extra posedge to
+//     guarantee the VHDL wb_registers process has exited the reset branch
+//   - Reset tasks use #1 after deassertion to force a delta-cycle flush
+//     so rst=0 propagates across the SV->VHDL boundary before any write
 //
 // =============================================================================
-// Compatible with: ModelSim DE 2022.3 (mixed VHDL + SV, xsim also supported)
+// Compatible with: ModelSim DE 2022.3 (mixed VHDL + SV)
 // =============================================================================
 
 `timescale 1ns/1ps
@@ -65,42 +65,34 @@ module tb_radio_link_1wire_pat6570;
     localparam real    CLK_PERIOD_NS   = 12.5;   // 80 MHz
     localparam int     WB_DAT_W        = 16;
     localparam int     WB_ADR_W        = 3;
-    localparam logic [2:0] WB_BASE     = 3'h0;   // addr is reg offset only
-    localparam int     NUM_REBOOT_ITER = 5;       // 5 x ~4ms = ~20ms sim time at divisor=5
+    localparam int     NUM_REBOOT_ITER = 5;
 
-    // Timing derived from RTL constants:
-    //   BAUD_MULTIPLIER=16, DEFAULT_DIVISOR=520 => 9600 baud @ 80 MHz
-    //   One byte = 10 bits = 160 baud-clocks = 160 * 520 * 12.5 ns = 1.04 ms
-    //   Sim uses DEFAULT_DIVISOR=5 (VHDL default set for sim; real HW uses 520)
-    localparam real BYTE_PERIOD_NS  = 16.0 * 5.0  * CLK_PERIOD_NS;  // ~1 us at divisor=5
-    localparam real FRAME_PERIOD_NS = 3.0  * BYTE_PERIOD_NS;         // 3 bytes = ~3 us
-    localparam real SETTLE_NS       = 2000.0 * BYTE_PERIOD_NS;       // covers 4*RECEIVE_TIMEOUT
-
-    // Hardware-accurate timeout from RTL constants (RECEIVE_TIMEOUT=481 byte-times)
-    localparam real RECEIVE_TIMEOUT_NS = 481.0 * BYTE_PERIOD_NS;
-
-    // Link-wait period from RTL (LINK_WAIT_PERIOD=46 byte-times)
-    localparam real LINK_WAIT_NS = 46.0 * BYTE_PERIOD_NS;
+    // Timing derived from RTL constants (DEFAULT_DIVISOR=5 for sim):
+    //   One byte = 16 * 5 * 12.5 ns = 1000 ns = 1 us
+    localparam real BYTE_PERIOD_NS     = 16.0 * 5.0 * CLK_PERIOD_NS;
+    localparam real FRAME_PERIOD_NS    = 3.0  * BYTE_PERIOD_NS;
+    localparam real SETTLE_NS          = 2000.0 * BYTE_PERIOD_NS;
+    localparam real RECEIVE_TIMEOUT_NS = 481.0  * BYTE_PERIOD_NS;
+    localparam real LINK_WAIT_NS       = 46.0   * BYTE_PERIOD_NS;
 
     // Register offsets
     localparam logic [2:0] REG_ID  = 3'd0;
     localparam logic [2:0] REG_DIV = 3'd1;
-    localparam logic [2:0] REG_PRS = 3'd2;  // PAIRED_RADIO_STATE  0x502
-    localparam logic [2:0] REG_PRB = 3'd3;  // PAIRED_BIT_STATE    0x503
-    localparam logic [2:0] REG_RS  = 3'd4;  // RADIO_STATE         0x504
-    localparam logic [2:0] REG_RB  = 3'd5;  // BIT_STATE           0x505
+    localparam logic [2:0] REG_PRS = 3'd2;
+    localparam logic [2:0] REG_PRB = 3'd3;
+    localparam logic [2:0] REG_RS  = 3'd4;
+    localparam logic [2:0] REG_RB  = 3'd5;
 
-    // Known state values
-    localparam logic [7:0] ST_NO_LINK   = 8'h00;
-    localparam logic [7:0] ST_NEW_LINK  = 8'hAA;
-    localparam logic [7:0] ST_ACTIVE    = 8'h41;
-    localparam logic [7:0] ST_INACTIVE  = 8'h69;
-    localparam logic [7:0] BT_NO_LINK   = 8'h00;
-    localparam logic [7:0] BT_FULL_SVC  = 8'h46;
-    localparam logic [7:0] BT_REDUCED   = 8'h52;
-    localparam logic [7:0] BT_NO_SVC    = 8'h6E;
+    // State values
+    localparam logic [7:0] ST_NO_LINK  = 8'h00;
+    localparam logic [7:0] ST_NEW_LINK = 8'hAA;
+    localparam logic [7:0] ST_ACTIVE   = 8'h41;
+    localparam logic [7:0] ST_INACTIVE = 8'h69;
+    localparam logic [7:0] BT_NO_LINK  = 8'h00;
+    localparam logic [7:0] BT_FULL_SVC = 8'h46;
+    localparam logic [7:0] BT_REDUCED  = 8'h52;
+    localparam logic [7:0] BT_NO_SVC   = 8'h6E;
 
-    // Test 5 sentinel value (matches John Stevens' Python test: TEST_VALUE=123)
     localparam logic [7:0] SELF_RX_TEST_VAL = 8'd123;
 
     // =========================================================================
@@ -118,7 +110,7 @@ module tb_radio_link_1wire_pat6570;
     // =========================================================================
 
     logic n_tx_a, n_tx_b;
-    wire  bus_w = n_tx_a & n_tx_b;  // wired-AND = open-drain
+    wire  bus_w = n_tx_a & n_tx_b;
 
     // =========================================================================
     // Wishbone @ DUT_A
@@ -145,59 +137,50 @@ module tb_radio_link_1wire_pat6570;
     logic                 b_ack;
 
     // =========================================================================
-    // DUT instantiations  (VHDL entities, bound by xelab mixed-language)
+    // DUT instantiations
+    // No generic map: uses VHDL defaults DEFAULT_DIVISOR=5, INVERT_RESET='0'
     // =========================================================================
 
-    // No generic map — ModelSim does not pass VHDL generics from SV reliably.
-    // Uses VHDL defaults: DEFAULT_DIVISOR=5 (set for sim), INVERT_RESET='0'.
     radio_link_1wire dut_a (
-        .RST_I     (rst_a),
-        .CLK_I     (clk),
-        .WB_ADR_I  (a_adr),
-        .WB_DAT_I  (a_wdat),
-        .WB_DAT_O  (a_rdat),
-        .WB_STB_I  (a_stb),
-        .WB_CYC_I  (a_cyc),
-        .WB_WE_I   (a_we),
-        .WB_ACK_O  (a_ack),
+        .RST_I       (rst_a),
+        .CLK_I       (clk),
+        .WB_ADR_I    (a_adr),
+        .WB_DAT_I    (a_wdat),
+        .WB_DAT_O    (a_rdat),
+        .WB_STB_I    (a_stb),
+        .WB_CYC_I    (a_cyc),
+        .WB_WE_I     (a_we),
+        .WB_ACK_O    (a_ack),
         .N_LINK_TX_O (n_tx_a),
         .N_LINK_RX_I (bus_w)
     );
 
     radio_link_1wire dut_b (
-        .RST_I     (rst_b),
-        .CLK_I     (clk),
-        .WB_ADR_I  (b_adr),
-        .WB_DAT_I  (b_wdat),
-        .WB_DAT_O  (b_rdat),
-        .WB_STB_I  (b_stb),
-        .WB_CYC_I  (b_cyc),
-        .WB_WE_I   (b_we),
-        .WB_ACK_O  (b_ack),
+        .RST_I       (rst_b),
+        .CLK_I       (clk),
+        .WB_ADR_I    (b_adr),
+        .WB_DAT_I    (b_wdat),
+        .WB_DAT_O    (b_rdat),
+        .WB_STB_I    (b_stb),
+        .WB_CYC_I    (b_cyc),
+        .WB_WE_I     (b_we),
+        .WB_ACK_O    (b_ack),
         .N_LINK_TX_O (n_tx_b),
         .N_LINK_RX_I (bus_w)
     );
 
     // =========================================================================
-    // Loop variables — must be module-level for ModelSim compatibility
+    // Module-level variables (ModelSim: no declarations inside named blocks)
     // =========================================================================
 
-    int         iter;
-    logic       reboot_a;
-
-    // =========================================================================
-    // Scoreboard counters
-    // =========================================================================
+    int   iter;
+    logic reboot_a;
 
     int unsigned total_checks   = 0;
     int unsigned pass_count     = 0;
     int unsigned fail_count     = 0;
     int unsigned self_echo_hits = 0;
     int unsigned byte_swap_hits = 0;
-
-    // =========================================================================
-    // Scratchpad registers — module-level for xsim/ModelSim compatibility
-    // =========================================================================
 
     logic [WB_DAT_W-1:0] chk_prs_a, chk_prb_a, chk_rs_a, chk_rb_a;
     logic [WB_DAT_W-1:0] chk_prs_b, chk_prb_b, chk_rs_b, chk_rb_b;
@@ -210,52 +193,52 @@ module tb_radio_link_1wire_pat6570;
 
     // =========================================================================
     // Wishbone helper tasks
+    //
+    // wb_write timing:
+    //   1. Guard: wait until rst=0 AND one extra posedge so the VHDL
+    //      wb_registers process has definitely exited the reset branch.
+    //      Without this, a write immediately after reset deassertion lands
+    //      while RST_I is still seen as '1' inside the VHDL process (delta
+    //      cycle ordering across the SV->VHDL boundary in ModelSim).
+    //   2. Drive adr/wdat/we at negedge — one full cycle before STB.
+    //   3. Assert stb/cyc at the next negedge.
+    //   4. Wait for ACK on posedge.
+    //   5. Deassert stb/cyc/we AND clear adr/wdat atomically at negedge.
+    //      Atomic cleardown prevents a rogue write of 0x0000 to whatever
+    //      address the bus transitions through during teardown.
     // =========================================================================
-    //
-    // KEY FIX: a_adr and a_wdat are cleared ATOMICALLY with a_stb/a_cyc/a_we
-    // at the negedge after ACK. This prevents a rogue write of 0x0000 to
-    // address 0 (or address 4 during transition) that was overwriting RadioState
-    // immediately after each successful write.
-    //
-    // Write sequence:
-    //   negedge: drive adr, wdat, we=1  (data stable one full cycle early)
-    //   posedge: data setup complete
-    //   negedge: assert stb, cyc
-    //   posedge: RTL samples wdat, asserts ack
-    //   negedge: deassert stb, cyc, we AND clear adr, wdat atomically
-    //   +4 posedge: bus settle
 
     task automatic wb_write_a (input logic [2:0]          reg_off,
                                input logic [WB_DAT_W-1:0] data);
+        // Guard: wait for reset deasserted plus one posedge propagation margin
         while (rst_a) @(posedge clk);
-        // Step 1: drive address and data one full cycle before STB
+        @(posedge clk);  // one extra cycle: guarantees VHDL has exited reset branch
+        // Step 1: drive adr/wdat/we one full cycle before STB
         @(negedge clk);
         a_adr  = reg_off;
         a_wdat = data;
         a_we   = 1'b1;
-        // Step 2: let data settle through one posedge
-        @(posedge clk);
-        // Step 3: assert STB/CYC
+        @(posedge clk);  // data settles through this posedge
+        // Step 2: assert STB/CYC
         @(negedge clk);
-        a_stb = 1'b1;
-        a_cyc = 1'b1;
-        // Step 4: wait for ACK
+        a_stb  = 1'b1;
+        a_cyc  = 1'b1;
+        // Step 3: wait for ACK
         do @(posedge clk); while (!a_ack);
-        // Step 5: deassert control AND clear address/data atomically
-        // — no window where stb/we/cyc are high with adr/wdat transitioning
+        // Step 4: deassert all control signals AND clear bus atomically
         @(negedge clk);
         a_stb  = 1'b0;
         a_cyc  = 1'b0;
         a_we   = 1'b0;
         a_adr  = 3'h0;
         a_wdat = 16'h0000;
-        // Step 6: bus settle
         repeat (4) @(posedge clk);
     endtask
 
     task automatic wb_read_a (input  logic [2:0]          reg_off,
                               output logic [WB_DAT_W-1:0] data);
         while (rst_a) @(posedge clk);
+        @(posedge clk);
         @(negedge clk);
         a_adr  = reg_off;
         a_we   = 1'b0;
@@ -273,6 +256,7 @@ module tb_radio_link_1wire_pat6570;
     task automatic wb_write_b (input logic [2:0]          reg_off,
                                input logic [WB_DAT_W-1:0] data);
         while (rst_b) @(posedge clk);
+        @(posedge clk);
         @(negedge clk);
         b_adr  = reg_off;
         b_wdat = data;
@@ -294,6 +278,7 @@ module tb_radio_link_1wire_pat6570;
     task automatic wb_read_b (input  logic [2:0]          reg_off,
                               output logic [WB_DAT_W-1:0] data);
         while (rst_b) @(posedge clk);
+        @(posedge clk);
         @(negedge clk);
         b_adr  = reg_off;
         b_we   = 1'b0;
@@ -316,7 +301,6 @@ module tb_radio_link_1wire_pat6570;
         logic [WB_DAT_W-1:0] rb;
         wb_write_a(REG_RS, {{(WB_DAT_W-8){1'b0}}, st});
         wb_write_a(REG_RB, {{(WB_DAT_W-8){1'b0}}, bt});
-        // Readback verification
         wb_read_a(REG_RS, rb);
         if (rb[7:0] !== st)
             $display("  WARN set_states_a: RS readback %02Xh != written %02Xh",
@@ -343,6 +327,14 @@ module tb_radio_link_1wire_pat6570;
 
     // =========================================================================
     // Reset helpers
+    //
+    // #1 after deassertion forces a delta-cycle flush so the blocking
+    // assignment rst=0 propagates to the VHDL process before any
+    // subsequent posedge evaluation. Without this, the VHDL wb_registers
+    // process can still see RST_I='1' on the first posedge after the SV
+    // assignment due to mixed-language delta-cycle ordering in ModelSim.
+    // 32 post-reset cycles guarantees the VHDL process has exited the
+    // reset branch before any Wishbone write is attempted.
     // =========================================================================
 
     task automatic reset_both ();
@@ -351,7 +343,8 @@ module tb_radio_link_1wire_pat6570;
         repeat (16) @(posedge clk);
         @(negedge clk);
         rst_a = 1'b0; rst_b = 1'b0;
-        repeat (16) @(posedge clk);  // generous settle after reset
+        #1;                          // delta-cycle flush
+        repeat (32) @(posedge clk);
     endtask
 
     task automatic reset_a_only ();
@@ -360,7 +353,8 @@ module tb_radio_link_1wire_pat6570;
         repeat (16) @(posedge clk);
         @(negedge clk);
         rst_a = 1'b0;
-        repeat (16) @(posedge clk);  // generous settle after reset
+        #1;                          // delta-cycle flush
+        repeat (32) @(posedge clk);
     endtask
 
     task automatic reset_b_only ();
@@ -369,7 +363,8 @@ module tb_radio_link_1wire_pat6570;
         repeat (16) @(posedge clk);
         @(negedge clk);
         rst_b = 1'b0;
-        repeat (16) @(posedge clk);
+        #1;                          // delta-cycle flush
+        repeat (32) @(posedge clk);
     endtask
 
     // =========================================================================
@@ -382,7 +377,6 @@ module tb_radio_link_1wire_pat6570;
         wb_read_a(REG_PRB, chk_prb_a);
         wb_read_a(REG_RS,  chk_rs_a);
         wb_read_a(REG_RB,  chk_rb_a);
-
         wb_read_b(REG_PRS, chk_prs_b);
         wb_read_b(REG_PRB, chk_prb_b);
         wb_read_b(REG_RS,  chk_rs_b);
@@ -400,7 +394,6 @@ module tb_radio_link_1wire_pat6570;
                  chk_prs_b[7:0], chk_prb_b[7:0],
                  chk_rs_b[7:0],  chk_rb_b[7:0]);
 
-        // Skip only when BOTH radios show no link
         if (chk_rs_a[7:0] == ST_NO_LINK && chk_rs_b[7:0] == ST_NO_LINK) begin
             $display("  SKIP (neither radio has link state)");
         end else begin
@@ -409,32 +402,28 @@ module tb_radio_link_1wire_pat6570;
             if (chk_prs_a[7:0] !== chk_rs_b[7:0]) begin
                 $display("  FAIL[1] A.PRS(502)=%02Xh != B.RS(504)=%02Xh",
                          chk_prs_a[7:0], chk_rs_b[7:0]);
-                fail_here = 1'b1;
-                fail_count++;
+                fail_here = 1'b1; fail_count++;
             end
 
             // [2] A.PRB == B.RB
             if (chk_prb_a[7:0] !== chk_rb_b[7:0]) begin
                 $display("  FAIL[2] A.PRB(503)=%02Xh != B.RB(505)=%02Xh",
                          chk_prb_a[7:0], chk_rb_b[7:0]);
-                fail_here = 1'b1;
-                fail_count++;
+                fail_here = 1'b1; fail_count++;
             end
 
             // [3] B.PRS == A.RS
             if (chk_prs_b[7:0] !== chk_rs_a[7:0]) begin
                 $display("  FAIL[3] B.PRS(502)=%02Xh != A.RS(504)=%02Xh",
                          chk_prs_b[7:0], chk_rs_a[7:0]);
-                fail_here = 1'b1;
-                fail_count++;
+                fail_here = 1'b1; fail_count++;
             end
 
             // [4] B.PRB == A.RB
             if (chk_prb_b[7:0] !== chk_rb_a[7:0]) begin
                 $display("  FAIL[4] B.PRB(503)=%02Xh != A.RB(505)=%02Xh",
                          chk_prb_b[7:0], chk_rb_a[7:0]);
-                fail_here = 1'b1;
-                fail_count++;
+                fail_here = 1'b1; fail_count++;
             end
 
             // [5] Self-echo: A.PRS != A.RB (only when values non-zero)
@@ -444,9 +433,7 @@ module tb_radio_link_1wire_pat6570;
                 if (chk_prs_a[7:0] === chk_rb_a[7:0]) begin
                     $display("  FAIL[5-SELF-ECHO] A.PRS(502)=%02Xh == A.RB(505)=%02Xh",
                              chk_prs_a[7:0], chk_rb_a[7:0]);
-                    self_echo_hits++;
-                    fail_here = 1'b1;
-                    fail_count++;
+                    self_echo_hits++; fail_here = 1'b1; fail_count++;
                 end
             end
 
@@ -455,18 +442,14 @@ module tb_radio_link_1wire_pat6570;
                 (chk_prs_a[7:0] !== chk_rs_b[7:0])) begin
                 $display("  FAIL[6-BYTESWAP] A.PRS(502)=%02Xh == B.RB(505)=%02Xh (B.RS=%02Xh)",
                          chk_prs_a[7:0], chk_rb_b[7:0], chk_rs_b[7:0]);
-                byte_swap_hits++;
-                fail_here = 1'b1;
-                fail_count++;
+                byte_swap_hits++; fail_here = 1'b1; fail_count++;
             end
 
             if (!fail_here) begin
                 pass_count++;
                 $display("  PASS");
             end
-
         end
-
     endtask
 
     // =========================================================================
@@ -475,21 +458,18 @@ module tb_radio_link_1wire_pat6570;
 
     initial begin : test_main
 
-        // Initialise all Wishbone signals
         a_adr  = 3'h0;  a_wdat = 16'h0000;
         a_stb  = 1'b0;  a_cyc  = 1'b0;  a_we = 1'b0;
         b_adr  = 3'h0;  b_wdat = 16'h0000;
         b_stb  = 1'b0;  b_cyc  = 1'b0;  b_we = 1'b0;
 
-        // Assert reset at time 0 — required so divisor_reg initialises to
-        // DEFAULT_DIVISOR=5. Without this, Uart16xBaudEn stays high.
-        rst_a = 1'b1;
-        rst_b = 1'b1;
+        // Initial reset — required so DEFAULT_DIVISOR=5 loads into divisor_reg
+        rst_a = 1'b1; rst_b = 1'b1;
         repeat (32) @(posedge clk);
         @(negedge clk);
-        rst_a = 1'b0;
-        rst_b = 1'b0;
-        repeat (16) @(posedge clk);
+        rst_a = 1'b0; rst_b = 1'b0;
+        #1;                          // delta-cycle flush
+        repeat (32) @(posedge clk);
 
         $display("================================================================");
         $display("TB  PAT6-570  1-Wire Link Negotiation Failure Reproduction");
@@ -511,9 +491,9 @@ module tb_radio_link_1wire_pat6570;
 
         // -----------------------------------------------------------------
         // TEST 2  Single-side reboot stress
-        //         Matches hardware failure window from log analysis:
-        //           T6-237006 forces Active at T+3s (LINK Down timeout)
-        //           T6-216882 times out at T+6s (New link timeout)
+        //         Matches hardware failure window:
+        //           T6-237006 forces Active at T+3s (LINK_WAIT_PERIOD)
+        //           T6-216882 times out at T+6s (RECEIVE_TIMEOUT)
         // -----------------------------------------------------------------
         $display("\n=== TEST 2: Single-side reboot x%0d ===", NUM_REBOOT_ITER);
 
@@ -562,13 +542,13 @@ module tb_radio_link_1wire_pat6570;
         wb_read_a(REG_RB,  t4_rb_a);
 
         total_checks++;
-        $display("  A.PRS(502)=%02Xh  A.RB(505)=%02Xh", t4_prs_a[7:0], t4_rb_a[7:0]);
+        $display("  A.PRS(502)=%02Xh  A.RB(505)=%02Xh",
+                 t4_prs_a[7:0], t4_rb_a[7:0]);
         if ((t4_prs_a[7:0] === t4_rb_a[7:0]) &&
             (t4_prs_a[7:0] !== 8'h00) &&
             (t4_rb_a[7:0]  !== 8'h00)) begin
-            $display("  FAIL[SELF-ECHO] A.PRS == A.RB  (self-receive confirmed)");
-            self_echo_hits++;
-            fail_count++;
+            $display("  FAIL[SELF-ECHO] A.PRS == A.RB");
+            self_echo_hits++; fail_count++;
         end else begin
             $display("  PASS  A.PRS != A.RB");
             pass_count++;
@@ -576,7 +556,6 @@ module tb_radio_link_1wire_pat6570;
 
         // -----------------------------------------------------------------
         // TEST 5  check_fpga_self_rx (John Stevens, 18-Aug-2026)
-        //         Write TEST_VALUE=123 to A.0x505, check A.0x502 != TEST_VALUE
         // -----------------------------------------------------------------
         $display("\n=== TEST 5: check_fpga_self_rx (TEST_VALUE=%0d) ===",
                  SELF_RX_TEST_VAL);
@@ -598,19 +577,18 @@ module tb_radio_link_1wire_pat6570;
                  SELF_RX_TEST_VAL, t5_prs_a[7:0]);
         if (t5_prs_a[7:0] === SELF_RX_TEST_VAL) begin
             $display("  FAIL[SELF-RX] A.PRS == TEST_VALUE => PAT6-570 reproduced");
-            self_echo_hits++;
-            fail_count++;
+            self_echo_hits++; fail_count++;
         end else begin
             $display("  PASS  A.PRS != TEST_VALUE");
             pass_count++;
         end
 
         // -----------------------------------------------------------------
-        // TEST 6  Manual toggle regression (Scott Hisee email 11-Sep-2026)
-        //         After negotiation (A=Active, B=Inactive), toggle B to Active.
-        //         Both radios should re-negotiate — one Active, one Inactive.
+        // TEST 6  Manual toggle regression (Scott Hisee, 11-Sep-2026)
+        //         After A=Active/B=Inactive negotiation, toggle B to Active.
+        //         Both should re-negotiate to one Active / one Inactive.
         // -----------------------------------------------------------------
-        $display("\n=== TEST 6: Manual toggle regression (Scott 11-Sep-2026) ===");
+        $display("\n=== TEST 6: Manual toggle regression ===");
 
         reset_both();
         set_states_a(ST_ACTIVE,   BT_FULL_SVC);
@@ -646,9 +624,8 @@ module tb_radio_link_1wire_pat6570;
 
         // -----------------------------------------------------------------
         // TEST 7  Link-down changeover
-        //         Hold A in reset (power-off simulation).
-        //         B should clear PRS within RECEIVE_TIMEOUT.
-        //         From hardware logs: this path WORKS on real HW.
+        //         Hold A in reset (power-off). B should clear PRS within
+        //         RECEIVE_TIMEOUT. Hardware logs confirm this path works.
         // -----------------------------------------------------------------
         $display("\n=== TEST 7: Link-down changeover (power-off simulation) ===");
 
@@ -660,12 +637,13 @@ module tb_radio_link_1wire_pat6570;
         $display("  Holding A in reset (simulating power-off)");
         @(negedge clk);
         rst_a = 1'b1;
+        #1;
         #(RECEIVE_TIMEOUT_NS * 2.0);
 
         wb_read_b(REG_PRS, t7_prs_b);
 
         total_checks++;
-        $display("  B.PRS(502)=%02Xh after link-down (expect 00h=LinkBroken)",
+        $display("  B.PRS(502)=%02Xh after link-down (expect 00h)",
                  t7_prs_b[7:0]);
         if (t7_prs_b[7:0] === 8'h00) begin
             $display("  PASS  B correctly cleared PRS after link-down");
@@ -677,14 +655,15 @@ module tb_radio_link_1wire_pat6570;
 
         @(negedge clk);
         rst_a = 1'b0;
-        repeat (16) @(posedge clk);
+        #1;
+        repeat (32) @(posedge clk);
 
         // -----------------------------------------------------------------
         // TEST 8  Reboot race — hardware log T+3s/T+6s window
-        //         From messages_237006.txt / messages_216882.txt (11-Sep-2026):
-        //           A reboots, forces Active after LINK_WAIT_PERIOD
-        //           B times out after RECEIVE_TIMEOUT if no valid frame seen
-        //         With fixed RTL, B must commit A's state within RECEIVE_TIMEOUT
+        //         From messages_237006.txt / messages_216882.txt:
+        //           A reboots, forces Active after LINK_WAIT_PERIOD (~3s HW)
+        //           B times out after RECEIVE_TIMEOUT (~6s HW) if no frame
+        //         With fixed RTL, B must commit A's state within timeout.
         // -----------------------------------------------------------------
         $display("\n=== TEST 8: Reboot race (hardware log T+3s/T+6s window) ===");
 
@@ -710,7 +689,7 @@ module tb_radio_link_1wire_pat6570;
             pass_count++;
         end else begin
             $display("  FAIL[RACE] B did not receive A's state within timeout window");
-            $display("         This is the PAT6-570 failure: B will go Active independently");
+            $display("         PAT6-570: B will go Active independently");
             fail_count++;
         end
 
@@ -724,7 +703,6 @@ module tb_radio_link_1wire_pat6570;
         $display("  Fail          : %0d", fail_count);
         $display("  Self-echo     : %0d", self_echo_hits);
         $display("  Byte-swap     : %0d", byte_swap_hits);
-
         if (fail_count > 0) begin
             $display("  RESULT: FAIL  PAT6-570 reproduced (%0d violations)",
                      fail_count);
