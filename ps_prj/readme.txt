@@ -489,6 +489,95 @@ module tb_radio_link_1wire_pat6570;
         $display("================================================================");
 
         // -----------------------------------------------------------------
+        // TEST 0  Wishbone loopback — write known values, read back
+        //         This test runs first and is independent of all negotiation
+        //         logic. If it fails, the Wishbone interface in the testbench
+        //         is broken and no other test result is meaningful.
+        //         Writes to REG_RS (0x504) and REG_RB (0x505) on both DUTs
+        //         using a set of known patterns and reads back immediately.
+        // -----------------------------------------------------------------
+        $display("\n=== TEST 0: Wishbone loopback (write-then-readback) ===");
+        begin
+            logic [WB_DAT_W-1:0] rb0;
+            logic [7:0] patterns [0:3];
+            logic        t0_fail;
+            int          p;
+
+            patterns[0] = 8'h41;  // ST_ACTIVE
+            patterns[1] = 8'h69;  // ST_INACTIVE
+            patterns[2] = 8'h46;  // BT_FULL_SVC
+            patterns[3] = 8'hA5;  // arbitrary pattern
+
+            t0_fail = 1'b0;
+
+            for (p = 0; p < 4; p++) begin
+                // --- DUT_A REG_RS ---
+                wb_write_a(REG_RS, {{(WB_DAT_W-8){1'b0}}, patterns[p]});
+                wb_read_a(REG_RS, rb0);
+                total_checks++;
+                if (rb0[7:0] !== patterns[p]) begin
+                    $display("  FAIL[WB-LOOPBACK] A.RS wrote %02Xh read %02Xh",
+                             patterns[p], rb0[7:0]);
+                    t0_fail = 1'b1; fail_count++;
+                end else begin
+                    $display("  PASS  A.RS write %02Xh readback %02Xh OK",
+                             patterns[p], rb0[7:0]);
+                    pass_count++;
+                end
+
+                // --- DUT_A REG_RB ---
+                wb_write_a(REG_RB, {{(WB_DAT_W-8){1'b0}}, patterns[p]});
+                wb_read_a(REG_RB, rb0);
+                total_checks++;
+                if (rb0[7:0] !== patterns[p]) begin
+                    $display("  FAIL[WB-LOOPBACK] A.RB wrote %02Xh read %02Xh",
+                             patterns[p], rb0[7:0]);
+                    t0_fail = 1'b1; fail_count++;
+                end else begin
+                    $display("  PASS  A.RB write %02Xh readback %02Xh OK",
+                             patterns[p], rb0[7:0]);
+                    pass_count++;
+                end
+
+                // --- DUT_B REG_RS ---
+                wb_write_b(REG_RS, {{(WB_DAT_W-8){1'b0}}, patterns[p]});
+                wb_read_b(REG_RS, rb0);
+                total_checks++;
+                if (rb0[7:0] !== patterns[p]) begin
+                    $display("  FAIL[WB-LOOPBACK] B.RS wrote %02Xh read %02Xh",
+                             patterns[p], rb0[7:0]);
+                    t0_fail = 1'b1; fail_count++;
+                end else begin
+                    $display("  PASS  B.RS write %02Xh readback %02Xh OK",
+                             patterns[p], rb0[7:0]);
+                    pass_count++;
+                end
+
+                // --- DUT_B REG_RB ---
+                wb_write_b(REG_RB, {{(WB_DAT_W-8){1'b0}}, patterns[p]});
+                wb_read_b(REG_RB, rb0);
+                total_checks++;
+                if (rb0[7:0] !== patterns[p]) begin
+                    $display("  FAIL[WB-LOOPBACK] B.RB wrote %02Xh read %02Xh",
+                             patterns[p], rb0[7:0]);
+                    t0_fail = 1'b1; fail_count++;
+                end else begin
+                    $display("  PASS  B.RB write %02Xh readback %02Xh OK",
+                             patterns[p], rb0[7:0]);
+                    pass_count++;
+                end
+            end
+
+            if (t0_fail) begin
+                $display("  TEST 0 FAILED — Wishbone read/write path broken.");
+                $display("  All subsequent test results are unreliable.");
+                $display("  Fix the testbench Wishbone tasks before proceeding.");
+            end else begin
+                $display("  TEST 0 PASSED — Wishbone read/write path verified.");
+            end
+        end
+
+        // -----------------------------------------------------------------
         // TEST 1  Clean dual power-on
         // -----------------------------------------------------------------
         $display("\n=== TEST 1: Clean dual power-on ===");
