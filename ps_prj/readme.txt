@@ -245,6 +245,13 @@ module tb_radio_link_1wire_pat6570;
         a_stb  = 1'b1;
         a_cyc  = 1'b1;
         do @(posedge clk); while (!a_ack);
+        // Sample data ONE posedge after ACK.
+        // WB_DAT_O is cleared to 0 at every rising edge then conditionally
+        // driven in the same VHDL delta. Sampling on the ACK posedge itself
+        // risks reading the cleared value due to SV->VHDL delta ordering in
+        // ModelSim mixed-language simulation. One extra posedge guarantees
+        // the driven value has settled onto a_rdat before we capture it.
+        @(posedge clk);
         data   = a_rdat;
         @(negedge clk);
         a_stb  = 1'b0;
@@ -285,6 +292,8 @@ module tb_radio_link_1wire_pat6570;
         b_stb  = 1'b1;
         b_cyc  = 1'b1;
         do @(posedge clk); while (!b_ack);
+        // Same delta-ordering fix as wb_read_a
+        @(posedge clk);
         data   = b_rdat;
         @(negedge clk);
         b_stb  = 1'b0;
