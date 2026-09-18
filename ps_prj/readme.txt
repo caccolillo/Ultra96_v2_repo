@@ -16,11 +16,8 @@ import time
 RESOURCE = sys.argv[1] if len(sys.argv) > 1 else \
            "/sys/bus/pci/devices/0000:01:00.0/resource0"
 
-# SYSCON base address in BAR (WB_STB_SYS_CON=4, WB_BLOCK_ADR_WIDTH=8)
-# BAR byte offset = 4 * 256 * 2 = 0x0800
 SYSCON_BASE = 0x0800
 
-# Register map from syscon.vhd constants
 REGS = [
     (0,  "ID_REV",             "Wishbone block revision ID"),
     (1,  "DSP_ALIVE",          "DSP alive counter (written by DSP)"),
@@ -40,7 +37,6 @@ REGS = [
     (15, "SW_RST",             "Software reset register"),
 ]
 
-# Open BAR
 try:
     fd  = os.open(RESOURCE, os.O_RDWR | os.O_SYNC)
     bar = mmap.mmap(fd, 65536, mmap.MAP_SHARED,
@@ -54,12 +50,15 @@ except Exception as e:
 
 def read16(offset):
     bar.seek(offset)
-    return int.from_bytes(bar.read(2), byteorder='little')
+    return int.from_bytes(bar.read(4), byteorder='little') & 0xFFFF
+
+def write16(offset, value):
+    bar.seek(offset)
+    bar.write(value.to_bytes(4, byteorder='little'))
 
 def bar_offset(reg_num):
     return SYSCON_BASE + reg_num * 2
 
-# Header
 print(f"Resource : {RESOURCE}")
 print(f"SYSCON base: 0x{SYSCON_BASE:04X}")
 print(f"Timestamp  : {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -78,7 +77,6 @@ for reg_num, name, desc in REGS:
         flag = ""
     print(f"{name:<24} 0x{offset:04X}   0x{val:04X}  {val:>6}  {desc}{flag}")
 
-# FPGA alive counter check
 print()
 print(f"Checking FPGA_ALIVE_ARM counter (waiting 2s) ...")
 alive_offset = bar_offset(4)
@@ -96,7 +94,6 @@ elif v2 == v1:
 else:
     print(f"  RESULT: WARN — counter wrapped ({v1} -> {v2})")
 
-# Build version string
 print()
 ver_hi = read16(bar_offset(10))
 ver_lo = read16(bar_offset(11))
@@ -104,7 +101,6 @@ ddmm   = read16(bar_offset(12))
 yyyy   = read16(bar_offset(13))
 if ver_hi != 0xFFFF and ver_lo != 0xFFFF:
     version = (ver_hi << 16) | ver_lo
-    # Date registers use BCD encoding
     dd   = ((ddmm >> 12) & 0xF) * 10 + ((ddmm >> 8) & 0xF)
     mm   = ((ddmm >> 4) & 0xF) * 10 + (ddmm & 0xF)
     yy_h = ((yyyy >> 12) & 0xF) * 10 + ((yyyy >> 8) & 0xF)
