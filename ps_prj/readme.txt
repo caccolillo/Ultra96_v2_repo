@@ -1,123 +1,300 @@
-#!/usr/bin/env python3
-"""
-dump_syscon.py — Full SYSCON register dump over PCIe BAR.
+// =============================================================================
+// tb_pcie_wb.sv
+// Testbench for S0841D_sim.vhd
+// Full SYSCON register dump + functional checks
+// =============================================================================
 
-Usage:
-  sudo python3 dump_syscon.py [resource0_path]
+`timescale 1ns/1ps
 
-Default: /sys/bus/pci/devices/0000:01:00.0/resource0
-"""
+module tb_pcie_wb;
 
-import os
-import mmap
-import sys
-import time
+    // -------------------------------------------------------------------------
+    // Parameters
+    // -------------------------------------------------------------------------
+    parameter AXI_CLK_PERIOD = 8;     // 125 MHz
+    parameter TIMEOUT_CYCLES = 2000;
 
-RESOURCE = sys.argv[1] if len(sys.argv) > 1 else \
-           "/sys/bus/pci/devices/0000:01:00.0/resource0"
+    // SYSCON base address
+    parameter [31:0] SYSCON_BASE = 32'h0000_0800;
 
-# SYSCON base address in BAR (WB_STB_SYS_CON=4, WB_BLOCK_ADR_WIDTH=8)
-# BAR byte offset = 4 * 256 * 2 = 0x0800
-SYSCON_BASE = 0x0800
+    // Register offsets (word offset * 2 = byte offset)
+    parameter [31:0] ADDR_ID_REV             = SYSCON_BASE + 32'h00;
+    parameter [31:0] ADDR_DSP_ALIVE          = SYSCON_BASE + 32'h02;
+    parameter [31:0] ADDR_ARM_ALIVE          = SYSCON_BASE + 32'h04;
+    parameter [31:0] ADDR_FPGA_ALIVE_DSP     = SYSCON_BASE + 32'h06;
+    parameter [31:0] ADDR_FPGA_ALIVE_ARM     = SYSCON_BASE + 32'h08;
+    parameter [31:0] ADDR_DISABLE_FP_CLK     = SYSCON_BASE + 32'h0A;
+    parameter [31:0] ADDR_DISABLE_CODEC_CLK  = SYSCON_BASE + 32'h0C;
+    parameter [31:0] ADDR_INIT_COMPLETE      = SYSCON_BASE + 32'h0E;
+    parameter [31:0] ADDR_PLL_LOCK           = SYSCON_BASE + 32'h10;
+    parameter [31:0] ADDR_ACTIVE_OUTPUT      = SYSCON_BASE + 32'h12;
+    parameter [31:0] ADDR_SCM_VERSION_HIGH   = SYSCON_BASE + 32'h14;
+    parameter [31:0] ADDR_SCM_VERSION_LOW    = SYSCON_BASE + 32'h16;
+    parameter [31:0] ADDR_BUILD_DATE_DDMM    = SYSCON_BASE + 32'h18;
+    parameter [31:0] ADDR_BUILD_DATE_YYYY    = SYSCON_BASE + 32'h1A;
+    parameter [31:0] ADDR_FULL_SAMPLE_RATE   = SYSCON_BASE + 32'h1C;
+    parameter [31:0] ADDR_SW_RST             = SYSCON_BASE + 32'h1E;
 
-# Register map from syscon.vhd constants
-REGS = [
-    (0,  "ID_REV",             "Wishbone block revision ID"),
-    (1,  "DSP_ALIVE",          "DSP alive counter (written by DSP)"),
-    (2,  "ARM_ALIVE",          "ARM alive counter (written by ARM)"),
-    (3,  "FPGA_ALIVE_DSP",     "FPGA alive counter (read by DSP)"),
-    (4,  "FPGA_ALIVE_ARM",     "FPGA alive counter (read by ARM)"),
-    (5,  "DISABLE_FP_CLK",     "Disable front panel clock output"),
-    (6,  "DISABLE_CODEC_CLK",  "Disable codec clock output"),
-    (7,  "INIT_COMPLETE",      "Initialisation complete flag"),
-    (8,  "PLL_LOCK",           "PLL lock pin state"),
-    (9,  "ACTIVE_OUTPUT",      "Active output pin state"),
-    (10, "SCM_VERSION_HIGH",   "SCM firmware version (high word)"),
-    (11, "SCM_VERSION_LOW",    "SCM firmware version (low word)"),
-    (12, "BUILD_DATE_DDMM",    "Build date (DD/MM)"),
-    (13, "BUILD_DATE_YYYY",    "Build date (year)"),
-    (14, "FULL_SAMPLE_RATE",   "Full sample rate flag (1=168ksps, 0=84ksps)"),
-    (15, "SW_RST",             "Software reset register"),
-]
+    // Expected values from versions.vhd and syscon.vhd
+    parameter [15:0] EXP_ID_REV            = 16'h0003;
+    parameter [15:0] EXP_SCM_VERSION_HIGH  = 16'hDEF8;
+    parameter [15:0] EXP_SCM_VERSION_LOW   = 16'h7C4A;
+    parameter [15:0] EXP_BUILD_DATE_DDMM   = 16'h3007;
+    parameter [15:0] EXP_BUILD_DATE_YYYY   = 16'h2026;
 
-# Open BAR
-try:
-    fd  = os.open(RESOURCE, os.O_RDWR | os.O_SYNC)
-    bar = mmap.mmap(fd, 65536, mmap.MAP_SHARED,
-                    mmap.PROT_READ | mmap.PROT_WRITE)
-except PermissionError:
-    print("ERROR: run with sudo")
-    sys.exit(1)
-except Exception as e:
-    print(f"ERROR: {e}")
-    sys.exit(1)
+    // -------------------------------------------------------------------------
+    // AXI4-Lite signals
+    // -------------------------------------------------------------------------
+    logic        aclk    = 0;
+    logic        aresetn = 0;
+    logic [31:0] awaddr  = 0;
+    logic        awvalid = 0;
+    logic        awready;
+    logic [31:0] wdata   = 0;
+    logic [3:0]  wstrb   = 4'hF;
+    logic        wvalid  = 0;
+    logic        wready;
+    logic [1:0]  bresp;
+    logic        bvalid;
+    logic        bready  = 1;
+    logic [31:0] araddr  = 0;
+    logic        arvalid = 0;
+    logic        arready;
+    logic [31:0] rdata;
+    logic [1:0]  rresp;
+    logic        rvalid;
+    logic        rready  = 1;
 
-def read16(offset):
-    bar.seek(offset)
-    return int.from_bytes(bar.read(2), byteorder='little')
+    // -------------------------------------------------------------------------
+    // DUT
+    // -------------------------------------------------------------------------
+    S0841D_sim dut (
+        .S_AXI_ACLK    (aclk),
+        .S_AXI_ARESETN (aresetn),
+        .S_AXI_AWADDR  (awaddr),
+        .S_AXI_AWVALID (awvalid),
+        .S_AXI_AWREADY (awready),
+        .S_AXI_WDATA   (wdata),
+        .S_AXI_WSTRB   (wstrb),
+        .S_AXI_WVALID  (wvalid),
+        .S_AXI_WREADY  (wready),
+        .S_AXI_BRESP   (bresp),
+        .S_AXI_BVALID  (bvalid),
+        .S_AXI_BREADY  (bready),
+        .S_AXI_ARADDR  (araddr),
+        .S_AXI_ARVALID (arvalid),
+        .S_AXI_ARREADY (arready),
+        .S_AXI_RDATA   (rdata),
+        .S_AXI_RRESP   (rresp),
+        .S_AXI_RVALID  (rvalid),
+        .S_AXI_RREADY  (rready)
+    );
 
-def bar_offset(reg_num):
-    return SYSCON_BASE + reg_num * 2
+    // -------------------------------------------------------------------------
+    // Clock
+    // -------------------------------------------------------------------------
+    always #(AXI_CLK_PERIOD/2) aclk = ~aclk;
 
-# Header
-print(f"Resource : {RESOURCE}")
-print(f"SYSCON base: 0x{SYSCON_BASE:04X}")
-print(f"Timestamp  : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-print()
-print(f"{'Register':<24} {'Offset':>6}  {'Value':>6}  {'Dec':>6}  Description")
-print("-" * 80)
+    // -------------------------------------------------------------------------
+    // Counters
+    // -------------------------------------------------------------------------
+    int pass_count = 0;
+    int fail_count = 0;
 
-no_ack_count = 0
-for reg_num, name, desc in REGS:
-    offset = bar_offset(reg_num)
-    val    = read16(offset)
-    if val == 0xFFFF:
-        flag = "  <-- NO ACK"
-        no_ack_count += 1
-    else:
-        flag = ""
-    print(f"{name:<24} 0x{offset:04X}   0x{val:04X}  {val:>6}  {desc}{flag}")
+    // -------------------------------------------------------------------------
+    // Tasks
+    // -------------------------------------------------------------------------
+    task automatic axi_read(
+        input  logic [31:0] addr,
+        output logic [31:0] data,
+        output logic [1:0]  resp
+    );
+        int cycles;
+        @(posedge aclk);
+        araddr  <= addr;
+        arvalid <= 1;
+        cycles = 0;
+        while (!arready) begin
+            @(posedge aclk);
+            if (++cycles > TIMEOUT_CYCLES) begin
+                $display("ERROR: ARREADY timeout at addr 0x%08X", addr);
+                fail_count++;
+                arvalid <= 0;
+                return;
+            end
+        end
+        @(posedge aclk);
+        arvalid <= 0;
+        cycles = 0;
+        while (!rvalid) begin
+            @(posedge aclk);
+            if (++cycles > TIMEOUT_CYCLES) begin
+                $display("ERROR: RVALID timeout at addr 0x%08X", addr);
+                fail_count++;
+                return;
+            end
+        end
+        data = rdata;
+        resp = rresp;
+        rready <= 1;
+        @(posedge aclk);
+    endtask
 
-# FPGA alive counter check
-print()
-print(f"Checking FPGA_ALIVE_ARM counter (waiting 2s) ...")
-alive_offset = bar_offset(4)
-v1 = read16(alive_offset)
-time.sleep(2.0)
-v2 = read16(alive_offset)
-print(f"  t=0s  : 0x{v1:04X} ({v1})")
-print(f"  t=2.0s: 0x{v2:04X} ({v2})")
-if v1 == 0xFFFF or v2 == 0xFFFF:
-    print("  RESULT: no ACK — bridge not responding")
-elif v2 > v1:
-    print(f"  RESULT: PASS — counter incremented by {v2 - v1}")
-elif v2 == v1:
-    print(f"  RESULT: FAIL — counter static ({v1}) — SYSCON not running")
-else:
-    print(f"  RESULT: WARN — counter wrapped ({v1} -> {v2})")
+    task automatic axi_write(
+        input logic [31:0] addr,
+        input logic [31:0] data
+    );
+        int cycles;
+        @(posedge aclk);
+        awaddr  <= addr;
+        awvalid <= 1;
+        wdata   <= data;
+        wvalid  <= 1;
+        wstrb   <= 4'hF;
+        cycles = 0;
+        while (!(awready && wready)) begin
+            @(posedge aclk);
+            if (++cycles > TIMEOUT_CYCLES) begin
+                $display("ERROR: AW/WREADY timeout at addr 0x%08X", addr);
+                fail_count++;
+                awvalid <= 0; wvalid <= 0;
+                return;
+            end
+        end
+        @(posedge aclk);
+        awvalid <= 0;
+        wvalid  <= 0;
+        cycles = 0;
+        while (!bvalid) begin
+            @(posedge aclk);
+            if (++cycles > TIMEOUT_CYCLES) begin
+                $display("ERROR: BVALID timeout at addr 0x%08X", addr);
+                fail_count++;
+                return;
+            end
+        end
+        @(posedge aclk);
+    endtask
 
-# Build version string
-print()
-ver_hi = read16(bar_offset(10))
-ver_lo = read16(bar_offset(11))
-ddmm   = read16(bar_offset(12))
-yyyy   = read16(bar_offset(13))
-if ver_hi != 0xFFFF and ver_lo != 0xFFFF:
-    version = (ver_hi << 16) | ver_lo
-    # Date registers use BCD encoding
-    dd   = ((ddmm >> 12) & 0xF) * 10 + ((ddmm >> 8) & 0xF)
-    mm   = ((ddmm >> 4) & 0xF) * 10 + (ddmm & 0xF)
-    yy_h = ((yyyy >> 12) & 0xF) * 10 + ((yyyy >> 8) & 0xF)
-    yy_l = ((yyyy >> 4) & 0xF) * 10 + (yyyy & 0xF)
-    year = yy_h * 100 + yy_l
-    print(f"Firmware version : 0x{version:08X}")
-    if year > 0:
-        print(f"Build date       : {dd:02d}/{mm:02d}/{year:04d}")
-    else:
-        print(f"Build date       : {dd:02d}/{mm:02d} (year not set)")
+    // Check exact value
+    task automatic check_exact(
+        input string       name,
+        input logic [31:0] got,
+        input logic [15:0] expected
+    );
+        if (got[15:0] === expected) begin
+            $display("PASS  %-24s = 0x%04X", name, got[15:0]);
+            pass_count++;
+        end else begin
+            $display("FAIL  %-24s = 0x%04X  (expected 0x%04X)", name, got[15:0], expected);
+            fail_count++;
+        end
+    endtask
 
-if no_ack_count > 0:
-    print(f"\nWARNING: {no_ack_count} register(s) returned 0xFFFF (no ACK)")
+    // Check not timeout (register responds)
+    task automatic check_ack(
+        input string       name,
+        input logic [31:0] got
+    );
+        if (got[15:0] === 16'hFFFF) begin
+            $display("FAIL  %-24s = 0xFFFF  (no ACK — timeout)", name);
+            fail_count++;
+        end else begin
+            $display("INFO  %-24s = 0x%04X  (%0d)", name, got[15:0], got[15:0]);
+            pass_count++;
+        end
+    endtask
 
-bar.close()
-os.close(fd)
+    // -------------------------------------------------------------------------
+    // Main
+    // -------------------------------------------------------------------------
+    logic [31:0] rd;
+    logic [1:0]  rsp;
+    logic [31:0] alive_t0, alive_t1;
+
+    initial begin
+        $display("=== tb_pcie_wb: SYSCON full dump ===");
+
+        // Reset
+        aresetn = 0;
+        repeat(20) @(posedge aclk);
+        aresetn = 1;
+        #2000;
+
+        // ------------------------------------------------------------------
+        // SYSCON register dump
+        // ------------------------------------------------------------------
+        $display("\n--- SYSCON register dump ---");
+        $display("%-26s  %6s  %6s", "Register", "Offset", "Value");
+        $display("%s", {60{"-"}});
+
+        axi_read(ADDR_ID_REV,            rd, rsp); check_exact("ID_REV",            rd, EXP_ID_REV);
+        axi_read(ADDR_DSP_ALIVE,         rd, rsp); check_ack  ("DSP_ALIVE",         rd);
+        axi_read(ADDR_ARM_ALIVE,         rd, rsp); check_ack  ("ARM_ALIVE",         rd);
+        axi_read(ADDR_FPGA_ALIVE_DSP,    rd, rsp); check_ack  ("FPGA_ALIVE_DSP",    rd);
+        axi_read(ADDR_FPGA_ALIVE_ARM,    rd, rsp); check_ack  ("FPGA_ALIVE_ARM",    rd);
+        axi_read(ADDR_DISABLE_FP_CLK,    rd, rsp); check_ack  ("DISABLE_FP_CLK",    rd);
+        axi_read(ADDR_DISABLE_CODEC_CLK, rd, rsp); check_ack  ("DISABLE_CODEC_CLK", rd);
+        axi_read(ADDR_INIT_COMPLETE,     rd, rsp); check_ack  ("INIT_COMPLETE",      rd);
+        axi_read(ADDR_PLL_LOCK,          rd, rsp); check_ack  ("PLL_LOCK",           rd);
+        axi_read(ADDR_ACTIVE_OUTPUT,     rd, rsp); check_ack  ("ACTIVE_OUTPUT",      rd);
+        axi_read(ADDR_SCM_VERSION_HIGH,  rd, rsp); check_exact("SCM_VERSION_HIGH",  rd, EXP_SCM_VERSION_HIGH);
+        axi_read(ADDR_SCM_VERSION_LOW,   rd, rsp); check_exact("SCM_VERSION_LOW",   rd, EXP_SCM_VERSION_LOW);
+        axi_read(ADDR_BUILD_DATE_DDMM,   rd, rsp); check_exact("BUILD_DATE_DDMM",   rd, EXP_BUILD_DATE_DDMM);
+        axi_read(ADDR_BUILD_DATE_YYYY,   rd, rsp); check_exact("BUILD_DATE_YYYY",   rd, EXP_BUILD_DATE_YYYY);
+        axi_read(ADDR_FULL_SAMPLE_RATE,  rd, rsp); check_ack  ("FULL_SAMPLE_RATE",  rd);
+        axi_read(ADDR_SW_RST,            rd, rsp); check_ack  ("SW_RST",            rd);
+
+        // ------------------------------------------------------------------
+        // FPGA alive counter increments
+        // ------------------------------------------------------------------
+        $display("\n--- FPGA_ALIVE_ARM increments over 5ms ---");
+        axi_read(ADDR_FPGA_ALIVE_ARM, alive_t0, rsp);
+        #5_000_000;
+        axi_read(ADDR_FPGA_ALIVE_ARM, alive_t1, rsp);
+        $display("  t=0ms : 0x%04X (%0d)", alive_t0[15:0], alive_t0[15:0]);
+        $display("  t=5ms : 0x%04X (%0d)", alive_t1[15:0], alive_t1[15:0]);
+        if (alive_t1 > alive_t0) begin
+            $display("PASS  FPGA_ALIVE_ARM incremented (%0d -> %0d)", alive_t0[15:0], alive_t1[15:0]);
+            pass_count++;
+        end else begin
+            $display("FAIL  FPGA_ALIVE_ARM did not increment");
+            fail_count++;
+        end
+
+        // ------------------------------------------------------------------
+        // ARM_ALIVE write/readback
+        // ------------------------------------------------------------------
+        $display("\n--- ARM_ALIVE write/readback ---");
+        axi_write(ADDR_ARM_ALIVE, 32'h0000_A55A);
+        axi_read (ADDR_ARM_ALIVE, rd, rsp);
+        check_exact("ARM_ALIVE readback", rd, 16'hA55A);
+
+        // ------------------------------------------------------------------
+        // DSP_ALIVE write/readback
+        // ------------------------------------------------------------------
+        $display("\n--- DSP_ALIVE write/readback ---");
+        axi_write(ADDR_DSP_ALIVE, 32'h0000_1234);
+        axi_read (ADDR_DSP_ALIVE, rd, rsp);
+        check_exact("DSP_ALIVE readback", rd, 16'h1234);
+
+        // ------------------------------------------------------------------
+        // Summary
+        // ------------------------------------------------------------------
+        $display("\n=== SUMMARY: %0d PASS, %0d FAIL ===", pass_count, fail_count);
+        if (fail_count == 0)
+            $display("ALL TESTS PASSED");
+        else
+            $display("FAILURES DETECTED");
+
+        $finish;
+    end
+
+    // Watchdog
+    initial begin
+        #50_000_000;
+        $display("WATCHDOG: simulation exceeded 50ms");
+        $finish;
+    end
+
+endmodule
