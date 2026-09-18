@@ -1,4 +1,3 @@
-
 -- =============================================================================
 -- S0841D_sim.vhd
 -- Simulation-only copy of S0841D architecture.
@@ -122,10 +121,6 @@ architecture behavioral of S0841D_sim is
     signal dsp_sync           : std_logic;
     signal debug              : std_logic_vector(5 downto 0);
 
-    -- Reset chain intermediate signals (faithful model of syscon FDPE chain)
-    signal bridge_rst  : std_logic := '1';
-    signal sync_rst    : std_logic := '1';
-
     -- Dummy signals for inout RS422 ports (VHDL forbids 'open' on inout)
     signal rs422_data_sim     : std_logic_vector(rs422_chan_range);
     signal rs422_dir_sim      : std_logic_vector(rs422_chan_range);
@@ -191,44 +186,16 @@ begin
     SYS_CLK <= CLOCK_20MHZ_I;
 
     -- =========================================================================
-    -- Reset chain: faithful model of syscon after both fixes:
-    --   fix 1: int_rst     <= RST_I   (GSR_I removed)
-    --   fix 2: int_pre_rst <= int_rst (locked dependency removed)
-    -- With RST_I='0' and int_pre_rst='0', the three FDPE FFs start preset
-    -- high and clear within 3 SYS_CLK cycles (~150 ns at 20 MHz).
+    -- GSR: simple power-on pulse
+    -- SYS_RST is driven by misc_1 RST_O (which comes from syscon real RTL)
+    -- This gives faithful simulation of the full reset chain in syscon.vhd
     -- =========================================================================
-
-    -- GSR: simple power-on pulse, no longer gating SYS_RST
     gsr_proc : process
     begin
         GSR(0) <= '1';
         wait for 500 ns;
         GSR(0) <= '0';
         wait;
-    end process;
-
-    -- first_stage_sync (FDPE): int_pre_rst='0' so clears on first SYS_CLK
-    first_stage_sync_proc : process(SYS_CLK)
-    begin
-        if rising_edge(SYS_CLK) then
-            bridge_rst <= '0';
-        end if;
-    end process;
-
-    -- second_stage_sync (FDPE)
-    second_stage_sync_proc : process(SYS_CLK)
-    begin
-        if rising_edge(SYS_CLK) then
-            sync_rst <= bridge_rst;
-        end if;
-    end process;
-
-    -- software_reset_sync (FDPE) -> SYS_RST
-    software_reset_sync_proc : process(SYS_CLK)
-    begin
-        if rising_edge(SYS_CLK) then
-            SYS_RST <= sync_rst;
-        end if;
     end process;
 
     -- ext_debug not instantiated in simulation (sdr_output_bus PIN_O has no
@@ -239,7 +206,7 @@ begin
     -- unused IRQ
     -- FPGA_IRQ7_O <= '1';  -- not a port in sim entity, ignore
 
-    -- unused Wishbone signals (copied verbatim from S0841D)
+    -- unused Wishbone signals (as is from S0841D)
     wb_s_ack(WB_STB_LEGACY_0 to WB_STB_LEGACY_3)           <= (others => '0');
     wb_s_ack(WB_STB_SPARE_15 to WB_STB_SPARE_15)           <= (others => '0');
     wb_s_ack(WB_STB_SPARE_23 to WB_STB_TX_DMA_ALIAS)       <= (others => '0');
@@ -334,7 +301,7 @@ begin
         );
 
     -- =========================================================================
-    -- led_flash_pattern_1 — copied verbatim from S0841D lines 651-674
+    -- led_flash_pattern_1 — as is from S0841D lines 651-674
     -- =========================================================================
     led_flash_pattern_1 : entity work.led_flash_pattern
         generic map (
@@ -359,7 +326,7 @@ begin
         );
 
     -- =========================================================================
-    -- misc_1 — copied verbatim from S0841D lines 679-692
+    -- misc_1 — as is from S0841D lines 679-692
     -- =========================================================================
     misc_1 : entity work.misc
         port map (
@@ -379,7 +346,7 @@ begin
             CLK_O              => open,
             FP_20M_REF_O       => open,
             CODEC_MCLK_O       => open,
-            RST_O              => open,
+            RST_O              => SYS_RST,  -- driven by syscon real RTL
             INIT_COMPLETE_O    => init_complete,
             PLL_LOCK_I         => '1',
             ACTIVE_OUTPUT_O    => open,
@@ -444,7 +411,7 @@ begin
         );
 
     -- =========================================================================
-    -- receiver_1 — copied verbatim from S0841D lines 773-818
+    -- receiver_1 — as is from S0841D lines 773-818
     -- =========================================================================
     receiver_1 : entity work.receiver
         generic map (
@@ -493,7 +460,7 @@ begin
         );
 
     -- =========================================================================
-    -- transmitter_1 — copied verbatim from S0841D lines 823-895
+    -- transmitter_1 — as is from S0841D lines 823-895
     -- =========================================================================
     transmitter_1 : entity work.transmitter
         generic map (
