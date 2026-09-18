@@ -104,10 +104,17 @@ ddmm   = read16(bar_offset(12))
 yyyy   = read16(bar_offset(13))
 if ver_hi != 0xFFFF and ver_lo != 0xFFFF:
     version = (ver_hi << 16) | ver_lo
-    dd   = (ddmm >> 8) & 0xFF
-    mm   = ddmm & 0xFF
+    # Date registers use BCD encoding
+    dd   = ((ddmm >> 12) & 0xF) * 10 + ((ddmm >> 8) & 0xF)
+    mm   = ((ddmm >> 4) & 0xF) * 10 + (ddmm & 0xF)
+    yy_h = ((yyyy >> 12) & 0xF) * 10 + ((yyyy >> 8) & 0xF)
+    yy_l = ((yyyy >> 4) & 0xF) * 10 + (yyyy & 0xF)
+    year = yy_h * 100 + yy_l
     print(f"Firmware version : 0x{version:08X}")
-    print(f"Build date       : {dd:02d}/{mm:02d}/{yyyy:04d}")
+    if year > 0:
+        print(f"Build date       : {dd:02d}/{mm:02d}/{year:04d}")
+    else:
+        print(f"Build date       : {dd:02d}/{mm:02d} (year not set)")
 
 if no_ack_count > 0:
     print(f"\nWARNING: {no_ack_count} register(s) returned 0xFFFF (no ACK)")
