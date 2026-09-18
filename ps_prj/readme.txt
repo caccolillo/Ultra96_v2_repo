@@ -2,6 +2,10 @@
 """
 dump_syscon.py — Full SYSCON register dump over PCIe BAR.
 
+Reads registers as 32-bit aligned transactions, splitting each 32-bit
+read into two 16-bit register values. This avoids AXI alignment issues
+with the axi4lite_to_wishbone_bridge.
+
 Usage:
   sudo python3 dump_syscon.py [resource0_path]
 
@@ -18,6 +22,7 @@ RESOURCE = sys.argv[1] if len(sys.argv) > 1 else \
 
 SYSCON_BASE = 0x0800
 
+# Register map: (offset_word, name, description)
 REGS = [
     (0,  "ID_REV",             "Wishbone block revision ID"),
     (1,  "DSP_ALIVE",          "DSP alive counter (written by DSP)"),
@@ -48,17 +53,38 @@ except Exception as e:
     print(f"ERROR: {e}")
     sys.exit(1)
 
-def read16(offset):
-    bar.seek(offset)
-    return int.from_bytes(bar.read(2), byteorder='little')
+def read_pair(byte_offset_even):
+    """Read two consecutive 16-bit registers as one 32-bit aligned transaction.
+    byte_offset_even must be 32-bit aligned (multiple of 4).
+    Returns (low16, high16).
+    """
+    bar.seek(byte_offset_even)
+    val32 = int.from_bytes(bar.read(4), byteorder='little')
+    return val32 & 0xFFFF, (val32 >> 16) & 0xFFFF
 
-def write16(offset, value):
-    bar.seek(offset)
+def write16(byte_offset, value):
+    """Write a 16-bit value as a 32-bit aligned transaction."""
+    bar.seek(byte_offset & ~3)  # align to 32-bit boundary
     bar.write(value.to_bytes(4, byteorder='little'))
 
 def bar_offset(reg_num):
     return SYSCON_BASE + reg_num * 2
 
+# Read all registers as 32-bit pairs
+# Group consecutive registers into 32-bit aligned reads
+reg_values = {}
+for reg_num, name, desc in REGS:
+    byte_off = bar_offset(reg_num)
+    # align to 32-bit boundary
+    aligned  = byte_off & ~3
+    lo, hi   = read_pair(aligned)
+    # determine if this reg is low or high 16 of the 32-bit word
+    if (byte_off & 2) == 0:
+        reg_values[reg_num] = lo
+    else:
+        reg_values[reg_num] = hi
+
+# Print dump
 print(f"Resource : {RESOURCE}")
 print(f"SYSCON base: 0x{SYSCON_BASE:04X}")
 print(f"Timestamp  : {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -69,7 +95,7 @@ print("-" * 80)
 no_ack_count = 0
 for reg_num, name, desc in REGS:
     offset = bar_offset(reg_num)
-    val    = read16(offset)
+    val    = reg_values[reg_num]
     if val == 0xFFFF:
         flag = "  <-- NO ACK"
         no_ack_count += 1
@@ -77,12 +103,18 @@ for reg_num, name, desc in REGS:
         flag = ""
     print(f"{name:<24} 0x{offset:04X}   0x{val:04X}  {val:>6}  {desc}{flag}")
 
+# FPGA alive counter check
 print()
 print(f"Checking FPGA_ALIVE_ARM counter (waiting 2s) ...")
-alive_offset = bar_offset(4)
-v1 = read16(alive_offset)
+def read_reg(reg_num):
+    byte_off = bar_offset(reg_num)
+    aligned  = byte_off & ~3
+    lo, hi   = read_pair(aligned)
+    return lo if (byte_off & 2) == 0 else hi
+
+v1 = read_reg(4)
 time.sleep(2.0)
-v2 = read16(alive_offset)
+v2 = read_reg(4)
 print(f"  t=0s  : 0x{v1:04X} ({v1})")
 print(f"  t=2.0s: 0x{v2:04X} ({v2})")
 if v1 == 0xFFFF or v2 == 0xFFFF:
@@ -94,11 +126,12 @@ elif v2 == v1:
 else:
     print(f"  RESULT: WARN — counter wrapped ({v1} -> {v2})")
 
+# Build version string
 print()
-ver_hi = read16(bar_offset(10))
-ver_lo = read16(bar_offset(11))
-ddmm   = read16(bar_offset(12))
-yyyy   = read16(bar_offset(13))
+ver_hi = reg_values[10]
+ver_lo = reg_values[11]
+ddmm   = reg_values[12]
+yyyy   = reg_values[13]
 if ver_hi != 0xFFFF and ver_lo != 0xFFFF:
     version = (ver_hi << 16) | ver_lo
     dd   = ((ddmm >> 12) & 0xF) * 10 + ((ddmm >> 8) & 0xF)
