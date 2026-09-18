@@ -50,7 +50,7 @@ end entity S0841D_sim;
 architecture behavioral of S0841D_sim is
 
     -- -------------------------------------------------------------------------
-    -- Copied verbatim from S0841D architecture declarations
+    -- Copied from S0841D architecture declarations
     -- -------------------------------------------------------------------------
     constant INVERT_RESET : std_logic := '0';
 
@@ -270,7 +270,7 @@ begin
 
     -- =========================================================================
     -- wb_distribution_1 — connected directly to wb_m_* (no legacy_dsp_remap)
-    -- Copied verbatim from S0841D lines 620-646
+    -- Copied from S0841D lines 620-646
     -- =========================================================================
     wb_distribution_1 : entity work.wb_distribution
         generic map (
