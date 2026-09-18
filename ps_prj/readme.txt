@@ -1,104 +1,116 @@
--- =============================================================================
--- ILA_1 — add to S0841D.vhd
--- Clock: SYS_CLK (80 MHz)
--- Probes: Wishbone master bus
--- =============================================================================
+#!/usr/bin/env python3
+"""
+dump_syscon.py — Full SYSCON register dump over PCIe BAR.
 
--- Component declaration (add in architecture declarative region, before begin):
+Usage:
+  sudo python3 dump_syscon.py [resource0_path]
 
-component ila_1
-    port (
-        clk      : in std_logic;
-        probe0   : in std_logic_vector(0 downto 0);   -- wb_m_stb
-        probe1   : in std_logic_vector(0 downto 0);   -- wb_m_cyc
-        probe2   : in std_logic_vector(0 downto 0);   -- wb_m_ack
-        probe3   : in std_logic_vector(0 downto 0);   -- wb_m_we
-        probe4   : in std_logic_vector(14 downto 0);  -- wb_m_adr
-        probe5   : in std_logic_vector(15 downto 0);  -- wb_m_rd_dat
-        probe6   : in std_logic_vector(15 downto 0);  -- wb_m_wr_dat
-        probe7   : in std_logic_vector(0 downto 0);   -- wb_s_cyc
-        probe8   : in std_logic_vector(0 downto 0);   -- wb_s_we
-        probe9   : in std_logic_vector(15 downto 0)   -- wb_s_rd_dat(WB_STB_SYS_CON)
-    );
-end component;
+Default: /sys/bus/pci/devices/0000:01:00.0/resource0
+"""
 
--- Instantiation (add after begin in S0841D.vhd):
+import os
+import mmap
+import sys
+import time
 
-ila_wb : ila_1
-    port map (
-        clk        => SYS_CLK,
-        probe0(0)  => wb_m_stb,
-        probe1(0)  => wb_m_cyc,
-        probe2(0)  => wb_m_ack,
-        probe3(0)  => wb_m_we,
-        probe4     => wb_m_adr,
-        probe5     => wb_m_rd_dat,
-        probe6     => wb_m_wr_dat,
-        probe7(0)  => wb_s_cyc,
-        probe8(0)  => wb_s_we,
-        probe9     => wb_s_rd_dat(WB_STB_SYS_CON)
-    );
+RESOURCE = sys.argv[1] if len(sys.argv) > 1 else \
+           "/sys/bus/pci/devices/0000:01:00.0/resource0"
 
+# SYSCON base address in BAR (WB_STB_SYS_CON=4, WB_BLOCK_ADR_WIDTH=8)
+# BAR byte offset = 4 * 256 * 2 = 0x0800
+SYSCON_BASE = 0x0800
 
--- =============================================================================
--- ILA_2 — add to axi4lite_to_wishbone_bridge.vhd
--- Clock: S_AXI_ACLK (125 MHz) — both state machines run here via CDC
--- Probes: CDC handshake and state machines
--- =============================================================================
+# Register map from syscon.vhd constants
+REGS = [
+    (0,  "ID_REV",             "Wishbone block revision ID"),
+    (1,  "DSP_ALIVE",          "DSP alive counter (written by DSP)"),
+    (2,  "ARM_ALIVE",          "ARM alive counter (written by ARM)"),
+    (3,  "FPGA_ALIVE_DSP",     "FPGA alive counter (read by DSP)"),
+    (4,  "FPGA_ALIVE_ARM",     "FPGA alive counter (read by ARM)"),
+    (5,  "DISABLE_FP_CLK",     "Disable front panel clock output"),
+    (6,  "DISABLE_CODEC_CLK",  "Disable codec clock output"),
+    (7,  "INIT_COMPLETE",      "Initialisation complete flag"),
+    (8,  "PLL_LOCK",           "PLL lock pin state"),
+    (9,  "ACTIVE_OUTPUT",      "Active output pin state"),
+    (10, "SCM_VERSION_HIGH",   "SCM firmware version (high word)"),
+    (11, "SCM_VERSION_LOW",    "SCM firmware version (low word)"),
+    (12, "BUILD_DATE_DDMM",    "Build date (DD/MM)"),
+    (13, "BUILD_DATE_YYYY",    "Build date (year)"),
+    (14, "FULL_SAMPLE_RATE",   "Full sample rate flag (1=168ksps, 0=84ksps)"),
+    (15, "SW_RST",             "Software reset register"),
+]
 
--- Component declaration (add in architecture declarative region, before begin):
+# Open BAR
+try:
+    fd  = os.open(RESOURCE, os.O_RDWR | os.O_SYNC)
+    bar = mmap.mmap(fd, 65536, mmap.MAP_SHARED,
+                    mmap.PROT_READ | mmap.PROT_WRITE)
+except PermissionError:
+    print("ERROR: run with sudo")
+    sys.exit(1)
+except Exception as e:
+    print(f"ERROR: {e}")
+    sys.exit(1)
 
-component ila_2
-    port (
-        clk      : in std_logic;
-        probe0   : in std_logic_vector(0 downto 0);  -- req_send
-        probe1   : in std_logic_vector(0 downto 0);  -- req_rcv
-        probe2   : in std_logic_vector(0 downto 0);  -- resp_send
-        probe3   : in std_logic_vector(0 downto 0);  -- resp_rcv
-        probe4   : in std_logic_vector(2 downto 0);  -- axi_state (6 values)
-        probe5   : in std_logic_vector(2 downto 0);  -- wb_state  (6 values)
-        probe6   : in std_logic_vector(0 downto 0);  -- axi_rst_sync
-        probe7   : in std_logic_vector(0 downto 0)   -- wb_rst_sync
-    );
-end component;
+def read16(offset):
+    bar.seek(offset)
+    return int.from_bytes(bar.read(2), byteorder='little')
 
--- Helper signals for encoding enums to std_logic_vector
--- (add in architecture declarative region, before begin):
+def bar_offset(reg_num):
+    return SYSCON_BASE + reg_num * 2
 
-signal axi_state_slv : std_logic_vector(2 downto 0);
-signal wb_state_slv  : std_logic_vector(2 downto 0);
+# Header
+print(f"Resource : {RESOURCE}")
+print(f"SYSCON base: 0x{SYSCON_BASE:04X}")
+print(f"Timestamp  : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+print()
+print(f"{'Register':<24} {'Offset':>6}  {'Value':>6}  {'Dec':>6}  Description")
+print("-" * 80)
 
--- Enum encoding (add after begin, before ila_bridge instantiation):
+no_ack_count = 0
+for reg_num, name, desc in REGS:
+    offset = bar_offset(reg_num)
+    val    = read16(offset)
+    if val == 0xFFFF:
+        flag = "  <-- NO ACK"
+        no_ack_count += 1
+    else:
+        flag = ""
+    print(f"{name:<24} 0x{offset:04X}   0x{val:04X}  {val:>6}  {desc}{flag}")
 
-with axi_state select axi_state_slv <=
-    "000" when AXI_IDLE,
-    "001" when AXI_PREP_REQ,
-    "010" when AXI_SEND_REQ,
-    "011" when AXI_WAIT_RESP,
-    "100" when AXI_RESP_WRITE,
-    "101" when AXI_RESP_READ,
-    "000" when others;
+# FPGA alive counter check
+print()
+print(f"Checking FPGA_ALIVE_ARM counter (waiting 2s) ...")
+alive_offset = bar_offset(4)
+v1 = read16(alive_offset)
+time.sleep(2.0)
+v2 = read16(alive_offset)
+print(f"  t=0s  : 0x{v1:04X} ({v1})")
+print(f"  t=2.0s: 0x{v2:04X} ({v2})")
+if v1 == 0xFFFF or v2 == 0xFFFF:
+    print("  RESULT: no ACK — bridge not responding")
+elif v2 > v1:
+    print(f"  RESULT: PASS — counter incremented by {v2 - v1}")
+elif v2 == v1:
+    print(f"  RESULT: FAIL — counter static ({v1}) — SYSCON not running")
+else:
+    print(f"  RESULT: WARN — counter wrapped ({v1} -> {v2})")
 
-with wb_state select wb_state_slv <=
-    "000" when WB_IDLE,
-    "001" when WB_DRIVE,
-    "010" when WB_WAIT_ACK,
-    "011" when WB_CAPTURE,
-    "100" when WB_SEND_RESP,
-    "101" when WB_WAIT_RCV,
-    "000" when others;
+# Build version string
+print()
+ver_hi = read16(bar_offset(10))
+ver_lo = read16(bar_offset(11))
+ddmm   = read16(bar_offset(12))
+yyyy   = read16(bar_offset(13))
+if ver_hi != 0xFFFF and ver_lo != 0xFFFF:
+    version = (ver_hi << 16) | ver_lo
+    dd   = (ddmm >> 8) & 0xFF
+    mm   = ddmm & 0xFF
+    print(f"Firmware version : 0x{version:08X}")
+    print(f"Build date       : {dd:02d}/{mm:02d}/{yyyy:04d}")
 
--- Instantiation (add after begin in axi4lite_to_wishbone_bridge.vhd):
+if no_ack_count > 0:
+    print(f"\nWARNING: {no_ack_count} register(s) returned 0xFFFF (no ACK)")
 
-ila_bridge : ila_2
-    port map (
-        clk        => S_AXI_ACLK,
-        probe0(0)  => req_send,
-        probe1(0)  => req_rcv,
-        probe2(0)  => resp_send,
-        probe3(0)  => resp_rcv,
-        probe4     => axi_state_slv,
-        probe5     => wb_state_slv,
-        probe6(0)  => axi_rst_sync,
-        probe7(0)  => wb_rst_sync
-    );
+bar.close()
+os.close(fd)
