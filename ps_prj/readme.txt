@@ -50,7 +50,7 @@ except Exception as e:
 
 def read16(offset):
     bar.seek(offset)
-    return int.from_bytes(bar.read(4), byteorder='little') & 0xFFFF
+    return int.from_bytes(bar.read(2), byteorder='little')
 
 def write16(offset, value):
     bar.seek(offset)
